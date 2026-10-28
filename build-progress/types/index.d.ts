@@ -1,6 +1,7 @@
 export type Marker = { kind: string; n: number; N: number; at: number; line: string }
 export type Sub = { id: string; description: string; started_at: number }
-export type Finish = { at: number; verdict: string; ok: boolean }
+/** `untimed`: the end is known but not when, so no minutes are shown. */
+export type Finish = { at: number; verdict: string; ok: boolean; untimed?: true }
 /** One item of the session's own to-do list; `mark` is the newest `▶ kind n/N` seen while it was in progress. */
 export type Task = {
   id: string
@@ -17,6 +18,8 @@ export type Status = {
   branch: string
   /** The session's first prompt, in `$.clock.now()` milliseconds. */
   started_at: number
+  /** False when `started_at` is only a lower bound (a reload could not find the first prompt's time). */
+  start_known: boolean
   updated_at: number
   prompt_id: string
   /** "lead" or "second" when the prompt says so. */

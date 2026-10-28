@@ -28,7 +28,7 @@ import {
 
 const NOW = 1_800_000_000_000
 const MIN = 60_000
-const base = (over: Partial<Status> = {}): Status => ({ ...blankStatus('s', '~/Work/x', 'main', NOW - 26 * MIN), prompt_id: 'MOD-3', updated_at: NOW, alive_at: NOW, ...over })
+const base = (over: Partial<Status> = {}): Status => ({ ...blankStatus('s', '~/Work/x', 'main', NOW - 26 * MIN), prompt_id: 'MOD-3', start_known: true, updated_at: NOW, alive_at: NOW, ...over })
 const task = (id: number, status: Task['status'], mark: Task['mark'] = null): Task => ({ id: String(id), subject: `Item ${id}`, status, mark })
 
 /** 6 items: 2 done, the third open at `▶ mutant 30/40`. */
@@ -211,6 +211,24 @@ describe('/builds text and history', () => {
     expect(s.expect_h).toBe(1)
     expect(progressOf(s, NOW).pct).toBe(75)
     expect(s.tool_now?.name).toBe('Bash')
+  })
+  test('a history that ends in the assistant\'s answer is Finished without minutes; an open call is working', () => {
+    const rows = [{ role: 'user', text: 'MOD-3 · x' }, { role: 'assistant', text: 'All done.', toolUses: [] }]
+    const s = recover(base({ prompt_id: '—' }), rows, NOW)
+    expect(s.finished?.untimed).toBe(true)
+    expect(bandLine(s, NOW)).toBe('✅ Finished')
+    const open = recover(base({ prompt_id: '—' }), [...rows.slice(0, 1), { role: 'assistant', text: 'Running', toolUses: [{ tool: 'Bash', input: {} }] }], NOW)
+    expect(open.finished).toBeNull()
+    expect(open.tool_now?.name).toBe('Bash')
+  })
+  test('an unknown start says "at least" and gives no time left', () => {
+    const s = base({ start_known: false, expect_h: 1 })
+    expect(bandLine(s, NOW)).toContain('time left not known yet')
+    expect(runLines(s, NOW).join('\n')).toContain('running for at least 26 min')
+  })
+  test('a stop by the person reads Stopped by you', () => {
+    const s = base({ finished: { at: NOW, verdict: 'stopped by you', ok: false } })
+    expect(bandLine(s, NOW)).toBe('⏸ Stopped by you · after 26 min')
   })
   test('with no history the title stays the folder', () => {
     expect(titleOf(recover(base({ prompt_id: '—' }), [], NOW))).toBe('x · main')

@@ -66,6 +66,7 @@ export const blankStatus = (session: string, folder: string, branch: string, now
   folder,
   branch,
   started_at: now,
+  start_known: false,
   updated_at: now,
   prompt_id: '—',
   role: null,
@@ -270,6 +271,7 @@ export const barText = (percent: number | null, cells = 10): string => {
 
 export const SESSION_CLOSED = 'session closed'
 export const TURN_ENDED = 'turn ended'
+export const STOPPED_BY_YOU = 'stopped by you'
 
 const WORKTREE = /\/mw-([A-Za-z0-9]+)-[^/]+$/
 
@@ -315,6 +317,8 @@ export type Progress = {
   isFromEstimate: boolean
   /** Minutes since the first prompt. */
   elapsed: number
+  /** True when the start is only a lower bound, so `elapsed` is a minimum. */
+  isAtLeast: boolean
 }
 
 /** The share of the whole prompt done: from the to-do list (items done + the open item's own n/N), else the ▶ phase markers. */
@@ -337,9 +341,12 @@ export const progressOf = (s: Status, now: number): Progress => {
   const frac = s.finished?.ok ? 1 : fractionOf(s)
   const pct = frac === null ? null : Math.round(frac * 100)
   const elapsed = Math.max(0, (now - s.started_at) / 60_000)
-  if (pct !== null && pct >= EARLY_PCT) return { pct, left: (elapsed * (100 - pct)) / pct, isFromEstimate: false, elapsed }
-  if (s.expect_h !== null) return { pct, left: Math.max(MIN_LEFT, s.expect_h * 60 - elapsed), isFromEstimate: true, elapsed }
-  return { pct, left: null, isFromEstimate: false, elapsed }
+  const isAtLeast = !s.start_known
+  // from a lower bound no time left can be worked out
+  if (isAtLeast) return { pct, left: null, isFromEstimate: false, elapsed, isAtLeast }
+  if (pct !== null && pct >= EARLY_PCT) return { pct, left: (elapsed * (100 - pct)) / pct, isFromEstimate: false, elapsed, isAtLeast }
+  if (s.expect_h !== null) return { pct, left: Math.max(MIN_LEFT, s.expect_h * 60 - elapsed), isFromEstimate: true, elapsed, isAtLeast }
+  return { pct, left: null, isFromEstimate: false, elapsed, isAtLeast }
 }
 
 export const NOT_REPORTED = '% not reported'
@@ -350,7 +357,7 @@ export const pctText = (p: Progress): string => (p.pct !== null ? `${p.pct}%` : 
 export const leftText = (p: Progress): string =>
   p.left === null ? 'time left not known yet' : `about ${fmtMin(p.left)} left${p.isFromEstimate ? ' (from the estimate)' : ''}`
 
-export const runningText = (p: Progress): string => `running for ${fmtMin(p.elapsed)}`
+export const runningText = (p: Progress): string => `running for ${p.isAtLeast ? 'at least ' : ''}${fmtMin(p.elapsed)}`
 
 /** The open item's name and its newest marker: `Phase 2: api server · mutant 30 of 40` (`30/40` when short). */
 export const workParts = (s: Status, isShort = false): string[] => {
@@ -391,8 +398,9 @@ const quietMin = (s: Status, now: number): number => Math.floor((now - s.updated
 /** `✅ Finished · took 2 h 41 min`, `❌ Stopped …`, `😴 Quiet for 12 min`, or null while working. */
 const endLine = (s: Status, p: Progress, now: number): string | null => {
   const st = stateOf(s, now)
-  const took = s.finished ? fmtMin((s.finished.at - s.started_at) / 60_000) : ''
-  if (st === 'done') return `✅ Finished · took ${took}`
+  const took = s.finished ? `${p.isAtLeast ? 'at least ' : ''}${fmtMin((s.finished.at - s.started_at) / 60_000)}` : ''
+  if (st === 'done') return s.finished?.untimed ? '✅ Finished' : `✅ Finished · took ${took}`
+  if (s.finished?.verdict === STOPPED_BY_YOU) return `⏸ Stopped by you · after ${took}`
   if (st === 'failed') return `❌ Stopped${p.pct === null ? '' : ` at ${p.pct}%`} · after ${took}`
   if (st === 'quiet') return `😴 Quiet for ${quietMin(s, now)} min`
   return null
@@ -464,6 +472,10 @@ export const recover = (s: Status, rows: readonly Row[], now: number): Status =>
   }
   const lastRow = rows[rows.length - 1]
   const open = lastRow?.role === 'assistant' ? lastRow.toolUses?.find(t => t.result === undefined && t.text === undefined) : undefined
+  // the last row is the assistant's final answer and nothing is open: the turn is over, when it ended is not in the history
+  if (!open && !out.finished && lastRow?.role === 'assistant' && typeof lastRow.text === 'string' && lastRow.text.trim() !== '') {
+    out = { ...out, finished: { at: now, verdict: TURN_ENDED, ok: true, untimed: true } }
+  }
   if (open) out = { ...out, tool_now: { name: scrub(String(open.tool ?? 'tool'), 40), detail: '' }, tool_since: now, alive_at: now }
   return out
 }
@@ -505,6 +517,7 @@ export const normalize = (raw: unknown): Status | null => {
     folder: str(r.folder, 120),
     branch: str(r.branch, 40) || '—',
     started_at: num(r.started_at) ?? (r.updated_at as number),
+    start_known: r.start_known === true,
     updated_at: r.updated_at as number,
     prompt_id: cleanId(str(r.prompt_id, 24)),
     role: r.role === 'lead' || r.role === 'second' ? r.role : null,
@@ -525,7 +538,7 @@ export const normalize = (raw: unknown): Status | null => {
       : [],
     finished:
       fin && typeof fin === 'object' && num(fin.at) !== null
-        ? { at: fin.at as number, verdict: str(fin.verdict, 60), ok: fin.ok === true }
+        ? { at: fin.at as number, verdict: str(fin.verdict, 60), ok: fin.ok === true, ...(fin.untimed === true ? { untimed: true as const } : {}) }
         : null,
   }
 }

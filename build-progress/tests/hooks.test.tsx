@@ -196,8 +196,8 @@ test('a session that loads the mod mid-way reads its first prompt, EXPECT and to
   const ui = await mountPane($)
   const all = await texts(ui)
   expect(all).toContain('50%')
-  expect(all).toContain('running for 40 min')
-  expect(all).toContain('about 40 min left')
+  expect(all).toContain('running for at least 40 min')
+  expect(all).toContain('time left not known yet')
   await ui.unmount()
 })
 
@@ -313,4 +313,81 @@ test('a reload keeps the first prompt as the start of elapsed time', async ($, o
   const ui = await mountPane($)
   expect(await texts(ui)).toMatch(/running for 1[56] min/)
   await ui.unmount()
+})
+
+const bandText = async ($: Engine): Promise<string> => {
+  const band = await $.ui.mount({ plugin: 'build-progress', surface: 'terminal', component: 'AbovePrompt', props: { hasSurvey: false } as never })
+  const t = JSON.stringify(await band.findAll({ type: 'Text' }))
+  await band.unmount()
+
+  return t
+}
+
+const finishedWindow = async ($: Engine, r: Rig) => {
+  await $.session.start(START)
+  await $.prompt.submit({ text: '# MOD-X\nEXPECT: 1 h' } as never)
+  await r.clock.advance(30 * 60_000)
+  await $.turn.complete({ turnId: 'x', reason: 'answer', text: 'ok', answer: 'ok' } as never)
+  await r.clock.advance(3000)
+  await $.session.end({ reason: 'exit' } as never)
+  r.history = [{ role: 'user', text: '# MOD-X\nEXPECT: 1 h', toolUses: [] }, { role: 'assistant', text: 'ok', toolUses: [] }]
+  r.launch = r.clock.now()
+}
+
+test('a finished window stays Finished after a reload, with the minutes from the file, and a slash command changes nothing', async ($, on) => {
+  const r = rig(on)
+  await finishedWindow($, r)
+  await $.session.start(START)
+  await r.clock.advance(40_000)
+  expect(await bandText($)).toContain('✅ Finished · took 30 min')
+  await $.prompt.submit({ text: '/reload-plugins' } as never)
+  await $.prompt.submit({ text: '/builds' } as never)
+  await r.clock.advance(40_000)
+  const band = await bandText($)
+  expect(band).toContain('✅ Finished · took 30 min')
+  expect(band).not.toContain('at least')
+  expect(mine(r).start_known).toBe(true)
+})
+
+test('a real message after a reload of a finished window goes back to working', async ($, on) => {
+  const r = rig(on)
+  await finishedWindow($, r)
+  await $.session.start(START)
+  await $.prompt.submit({ text: 'one more thing' } as never)
+  await r.clock.advance(31_000)
+  expect(await bandText($)).not.toContain('Finished')
+})
+
+test('a finished window with no status file is Finished without minutes', async ($, on) => {
+  const r = rig(on)
+  r.history = [{ role: 'user', text: '# MOD-X', toolUses: [] }, { role: 'assistant', text: 'ok', toolUses: [] }]
+  r.launch = r.clock.now()
+  await $.session.start(START)
+  await r.clock.advance(40_000)
+  expect(await bandText($)).toContain('✅ Finished')
+  expect(await bandText($)).not.toContain('took')
+})
+
+test('a reload with an open tool call is working, and a start from an older file without the flag says at least', async ($, on) => {
+  const r = rig(on)
+  r.files.set(`${DIR}/s1.json`, JSON.stringify({ v: 2, session: 's1', folder: '~/x', branch: 'main', started_at: r.clock.now() - 30 * 60_000, updated_at: r.clock.now(), prompt_id: 'MOD-X', finished: { at: r.clock.now(), verdict: 'session closed', ok: true } }))
+  r.history = [{ role: 'user', text: '# MOD-X', toolUses: [] }, { role: 'assistant', text: 'Running', toolUses: [{ tool: 'Bash', input: {} }] }]
+  r.launch = r.clock.now() - 3 * 60_000
+  await $.session.start(START)
+  await r.clock.advance(40_000)
+  const band = await bandText($)
+  expect(band).not.toContain('Finished')
+  const ui = await mountPane($)
+  expect(await texts(ui)).toMatch(/running for at least 3\d min/)
+  await ui.unmount()
+})
+
+test('a turn the person stops shows Stopped by you', async ($, on) => {
+  const r = rig(on)
+  await $.session.start(START)
+  await $.prompt.submit({ text: '# MOD-X' } as never)
+  await r.clock.advance(12 * 60_000)
+  await $.turn.complete({ turnId: 'x', reason: 'aborted', isAborted: true, text: '', answer: '' } as never)
+  await r.clock.advance(31_000)
+  expect(await bandText($)).toContain('⏸ Stopped by you · after 12 min')
 })

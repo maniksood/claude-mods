@@ -8,6 +8,7 @@ import {
   DELETE_MS,
   HEARTBEAT_MS,
   SESSION_CLOSED,
+  STOPPED_BY_YOU,
   TURN_ENDED,
   applyParsed,
   applyTool,
@@ -140,9 +141,15 @@ export const register: Register = (on, options) => {
       // no history to read: the title stays the folder
     }
     try {
-      // a reload starts from a blank status; the first prompt's time is kept from this session's own earlier file
+      // a reload starts from a blank status; the first prompt's time and the end time are kept from this session's own earlier file
       const old = normalize(JSON.parse(await $.fs.read(`${dir}/${sid}.json`)))
-      if (old && old.session === sid && old.started_at < status.started_at) status = { ...status, started_at: old.started_at }
+      if (old && old.session === sid) {
+        if (old.start_known) status = { ...status, started_at: old.started_at, start_known: true }
+        else if (old.started_at < status.started_at) status = { ...status, started_at: old.started_at }
+        if (status.finished?.untimed && old.finished && !old.finished.untimed && old.finished.verdict !== ALL_DONE) {
+          status = { ...status, finished: { ...old.finished, verdict: old.finished.verdict === SESSION_CLOSED ? TURN_ENDED : old.finished.verdict } }
+        }
+      }
     } catch {
       // no earlier file
     }
@@ -178,13 +185,15 @@ export const register: Register = (on, options) => {
   })
 
   on('prompt.submit', async ($, e, next) => {
+    // a slash command is not work: it changes neither the finish nor the start time
+    if (e.text.trimStart().startsWith('/')) return next(e)
     if (status && !hasPrompt) {
       hasPrompt = true
       const now = await $.clock.now()
       const id = promptIdFrom(e.text)
       const role = roleFrom(e.text)
       const expect = expectFrom(e.text)
-      await change($, s => ({ ...s, started_at: now, prompt_id: id, role: role ?? s.role, expect_h: expect }))
+      await change($, s => ({ ...s, started_at: now, start_known: true, prompt_id: id, role: role ?? s.role, expect_h: expect }))
     } else {
       await change($, s => ({ ...s, finished: s.finished?.verdict === ALL_DONE ? s.finished : null }))
     }
@@ -258,11 +267,12 @@ export const register: Register = (on, options) => {
       await change($, s => ({ ...s, subagents: s.subagents.filter(x => x.id !== id) }))
     } else {
       const failed = e.reason === 'error' || e.reason === 'refusal'
+      const stopped = e.reason === 'aborted'
       await change($, s => ({
         ...s,
         tool_now: null,
         tool_since: null,
-        finished: s.finished ?? (failed ? { at: s.updated_at, verdict: scrub(`ended: ${e.reason}`, 60), ok: false } : e.reason === 'answer' && s.subagents.length === 0 ? { at: s.updated_at, verdict: TURN_ENDED, ok: true } : null),
+        finished: s.finished ?? (stopped ? { at: s.updated_at, verdict: STOPPED_BY_YOU, ok: false } : failed ? { at: s.updated_at, verdict: scrub(`ended: ${e.reason}`, 60), ok: false } : e.reason === 'answer' && s.subagents.length === 0 ? { at: s.updated_at, verdict: TURN_ENDED, ok: true } : null),
       }))
     }
 
