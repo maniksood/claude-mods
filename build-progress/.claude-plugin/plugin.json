@@ -1,0 +1,18 @@
+{
+  "name": "build-progress",
+  "version": "0.3.0",
+  "description": "Shows this session's progress: % done, time left and what it is doing",
+  "types": "./types/index.d.ts",
+  "author": {
+    "name": "claude-mods authors"
+  },
+  "license": "MIT",
+  "userConfig": {
+    "folder_labels": {
+      "type": "string",
+      "title": "Folder labels",
+      "description": "Optional names for folders, as path-suffix=label pairs separated by commas, e.g. Work/project-a=main clone,Work/project-b=design clone. Empty shows each folder's last part.",
+      "default": ""
+    }
+  }
+}

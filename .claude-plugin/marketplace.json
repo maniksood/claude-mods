@@ -1,0 +1,16 @@
+{
+  "name": "claude-mods",
+  "owner": {
+    "name": "claude-mods authors"
+  },
+  "metadata": {
+    "description": "A collection of Claude Code mods"
+  },
+  "plugins": [
+    {
+      "name": "build-progress",
+      "source": "./build-progress",
+      "description": "Shows this session's progress: % done, time left and what it is doing, in a side panel and a band above the chat box"
+    }
+  ]
+}

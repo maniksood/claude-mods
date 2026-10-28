@@ -1,0 +1,242 @@
+import { describe, expect, test } from 'claude-code/testing'
+
+import type { Status, Task } from '../types'
+import { avatarSvg } from '../hooks/art'
+import {
+  ALL_DONE,
+  applyParsed,
+  applyTool,
+  bandLine,
+  blankStatus,
+  cardOf,
+  expectFrom,
+  normalize,
+  parseText,
+  progressOf,
+  promptIdFrom,
+  recover,
+  runLines,
+  scrub,
+  settle,
+  stateOf,
+  titleOf,
+  toolNow,
+  type RunState,
+  folderName,
+  parseFolderLabels,
+} from '../hooks/logic'
+
+const NOW = 1_800_000_000_000
+const MIN = 60_000
+const base = (over: Partial<Status> = {}): Status => ({ ...blankStatus('s', '~/Work/x', 'main', NOW - 26 * MIN), prompt_id: 'MOD-3', updated_at: NOW, alive_at: NOW, ...over })
+const task = (id: number, status: Task['status'], mark: Task['mark'] = null): Task => ({ id: String(id), subject: `Item ${id}`, status, mark })
+
+/** 6 items: 2 done, the third open at `▶ mutant 30/40`. */
+const six = (over: Partial<Status> = {}): Status =>
+  base({
+    tasks: [task(1, 'completed'), task(2, 'completed'), { ...task(3, 'in_progress'), subject: 'Phase 2: api server', mark: { kind: 'mutant', n: 30, N: 40 } }, task(4, 'pending'), task(5, 'pending'), task(6, 'pending')],
+    ...over,
+  })
+
+describe('safety', () => {
+  test('a Bash call shows its description and never its command', () => {
+    expect(toolNow({ tool: 'Bash', description: 'Print a greeting', command: 'echo sk-live-AbCdEf1234567890XyZ' } as never)).toEqual({ name: 'Bash', detail: 'Print a greeting' })
+  })
+  test('other tools show a file name only, protected names are hidden', () => {
+    expect(toolNow({ tool: 'Edit', file_path: '/a/b/c.ts' })).toEqual({ name: 'Edit', detail: 'c.ts' })
+    expect(toolNow({ tool: 'Read', file_path: '/a/.env' }).detail).toBe('(protected file)')
+  })
+  test('token-like strings are cut from any shown line', () => {
+    expect(scrub('key sk-live-AbCdEf1234567890XyZ here')).not.toContain('AbCdEf')
+    expect(scrub('password: hunter2')).toBe('password=…')
+  })
+  test('a broken file is refused', () => {
+    expect(normalize(null)).toBeNull()
+    expect(normalize({ session: 'a' })).toBeNull()
+    expect(normalize({ session: 'a', updated_at: NOW })?.tasks).toEqual([])
+  })
+})
+
+describe('whole-prompt percent', () => {
+  test('6 items, 2 done, the third at ▶ mutant 30/40 = (2 + 0.75) / 6 = 46%', () => {
+    expect(progressOf(six(), NOW).pct).toBe(46)
+    expect(cardOf(six(), NOW).pct).toBe('46%')
+  })
+  test('an open item with no marker counts 0 of itself', () => {
+    expect(progressOf(six({ tasks: six().tasks.map(t => ({ ...t, mark: null })) }), NOW).pct).toBe(33)
+  })
+  test('the newest marker lands on the open item', () => {
+    let s = six({ tasks: six().tasks.map(t => ({ ...t, mark: null })) })
+    s = applyParsed(s, parseText('working\n▶ mutant 10/40', NOW), NOW)
+    s = applyParsed(s, parseText('▶ mutant 20/40', NOW), NOW)
+    expect(s.tasks[2]?.mark).toEqual({ kind: 'mutant', n: 20, N: 40 })
+    expect(progressOf(s, NOW).pct).toBe(42)
+  })
+  test('with no to-do list the ▶ phase markers are used, as in MOD-2', () => {
+    let s = base()
+    s = applyParsed(s, parseText('▶ phase 2/4\n▶ step 5/10', NOW), NOW)
+    expect(progressOf(s, NOW).pct).toBe(38)
+  })
+  test('no plan at all: no percent, and the band does not say "starting"', () => {
+    expect(progressOf(base(), NOW).pct).toBeNull()
+    expect(bandLine(base(), NOW)).not.toContain('starting')
+    expect(bandLine(six(), NOW)).not.toContain('starting')
+  })
+})
+
+describe('time left', () => {
+  test('before 10%: EXPECT minus elapsed, shown as from the estimate', () => {
+    const s = base({ expect_h: 4, tasks: [task(1, 'in_progress'), ...[2, 3, 4, 5, 6, 7, 8, 9, 10, 11].map(i => task(i, 'pending'))] })
+    expect(bandLine(s, NOW)).toContain('about 3 h 34 min left (from the estimate)')
+    expect(cardOf(s, NOW).left).toBe('about 3 h 34 min left (from the estimate)')
+  })
+  test('before 10% the estimate never goes below 5 min', () => {
+    const s = base({ expect_h: 0.25, started_at: NOW - 60 * MIN })
+    expect(progressOf(s, NOW).left).toBe(5)
+  })
+  test('from 10%: elapsed × (100 − %) ÷ %', () => {
+    const s = six({ started_at: NOW - 50 * MIN, expect_h: 9 })
+    // 46%: 50 × 54 / 46 = 58.7 min
+    expect(Math.round((progressOf(s, NOW).left ?? 0) * 10) / 10).toBe(58.7)
+    expect(cardOf(s, NOW).left).toBe('about 59 min left')
+  })
+  test('exactly 10% switches to elapsed-based', () => {
+    const s = base({ started_at: NOW - 30 * MIN, expect_h: 5, tasks: [{ ...task(1, 'in_progress'), mark: { kind: 'x', n: 1, N: 1 } }, ...[2, 3, 4, 5, 6, 7, 8, 9, 10].map(i => task(i, 'pending'))] })
+    expect(progressOf(s, NOW).pct).toBe(10)
+    expect(cardOf(s, NOW).left).toBe('about 4 h 30 min left')
+  })
+  test('no EXPECT and under 10%: not known yet', () => {
+    const s = base({ tasks: [task(1, 'in_progress'), ...[2, 3, 4, 5, 6, 7, 8, 9, 10, 11].map(i => task(i, 'pending'))] })
+    expect(cardOf(s, NOW).left).toBe('time left not known yet')
+    expect(bandLine(s, NOW)).toContain('time left not known yet')
+  })
+  test('elapsed counts from the first prompt, not from the mod load', () => {
+    expect(cardOf(base({ started_at: NOW - 26 * MIN }), NOW).running).toBe('running for 26 min')
+    expect(cardOf(base({ started_at: NOW - 90 * MIN }), NOW).running).toBe('running for 1 h 30 min')
+  })
+  test('EXPECT is read from the header line; none is handled', () => {
+    expect(expectFrom('MODEL: Sonnet 5.5 EFFORT: medium WHY: x EXPECT: 1 h')).toBe(1)
+    expect(expectFrom('# MOD-3\nEXPECT: 2.5 h\nbody')).toBe(2.5)
+    expect(expectFrom('# MOD-3\nbody with no estimate')).toBeNull()
+    expect(promptIdFrom('MODEL: x EXPECT: 1 h\nMOD-3 · Builds panel\nbody')).toBe('MOD-3')
+  })
+})
+
+describe('the to-do list from the task tools', () => {
+  test('TodoWrite sends the whole list', () => {
+    const t = applyTool([], 'TodoWrite', { todos: [{ content: 'Step 0', status: 'completed', activeForm: 'x' }, { content: 'Phase 1', status: 'in_progress', activeForm: 'y' }] }, {})
+    expect(t.map(x => `${x.subject}:${x.status}`)).toEqual(['Step 0:completed', 'Phase 1:in_progress'])
+  })
+  test('TaskCreate adds with the id of its result, TaskUpdate changes or deletes', () => {
+    let t = applyTool([], 'TaskCreate', { subject: 'A', description: 'd' }, { task: { id: '7', subject: 'A' } })
+    t = applyTool(t, 'TaskCreate', { subject: 'B', description: 'd' }, { task: { id: '8', subject: 'B' } })
+    t = applyTool(t, 'TaskUpdate', { taskId: '7', status: 'completed' }, { success: true })
+    t = applyTool(t, 'TaskUpdate', { taskId: '8', status: 'in_progress' }, { success: true })
+    expect(t.map(x => `${x.id}:${x.status}`)).toEqual(['7:completed', '8:in_progress'])
+    expect(applyTool(t, 'TaskUpdate', { taskId: '8', status: 'deleted' }, { success: true }).map(x => x.id)).toEqual(['7'])
+    expect(applyTool(t, 'TaskUpdate', { taskId: '8', status: 'completed' }, { success: false })).toEqual(t)
+  })
+})
+
+describe('status of the work', () => {
+  test('the band is one line in the agreed shape', () => {
+    const s = six({ started_at: NOW - 50 * MIN, tool_now: { name: 'Bash', detail: 'Running mutants' }, alive_at: NOW })
+    expect(bandLine(s, NOW)).toBe('🧬 46% ▰▰▰▰▰▱▱▱▱▱ · about 59 min left · Phase 2: api server · mutant 30/40')
+  })
+  test('the card says the item, the marker and what runs now', () => {
+    const c = cardOf(six({ tool_now: { name: 'Bash', detail: 'Running mutants' }, alive_at: NOW }), NOW)
+    expect(c.work).toBe('Phase 2: api server · mutant 30 of 40')
+    expect(c.doing).toBe('Now: Running mutants')
+  })
+  test('the states: tests, mutants, building', () => {
+    const at = (s: Status): RunState => stateOf(s, NOW)
+    const tools = { alive_at: NOW, updated_at: NOW }
+    expect(at(six({ ...tools, tasks: six().tasks.map(t => ({ ...t, mark: null })), tool_now: { name: 'Bash', detail: 'Run the pytest suite' } }))).toBe('testing')
+    expect(at(six(tools))).toBe('mutation')
+    expect(at(base({ ...tools, tool_now: { name: 'Edit', detail: 'a.ts' } }))).toBe('building')
+  })
+  test('title is the prompt id; with none the folder and branch, never a session id', () => {
+    expect(titleOf(base())).toBe('MOD-3')
+    expect(titleOf(base({ prompt_id: '—' }))).toBe('x · main')
+    expect(titleOf(base({ prompt_id: 'd2aef7d2-e2ea-4d7a-9b27-67abcdef1234' }))).toBe('x · main')
+  })
+})
+
+describe('finished and quiet', () => {
+  test('the last item done: finished, took the whole time, 100%', () => {
+    const done = settle(base({ started_at: NOW - 161 * MIN, tasks: [task(1, 'completed'), task(2, 'completed')] }), NOW)
+    expect(done.finished?.verdict).toBe(ALL_DONE)
+    expect(bandLine(done, NOW)).toBe('✅ Finished · took 2 h 41 min')
+    expect(progressOf(done, NOW).pct).toBe(100)
+  })
+  test('a new item takes the finish back', () => {
+    const done = settle(base({ tasks: [task(1, 'completed')] }), NOW)
+    expect(settle({ ...done, tasks: [...done.tasks, task(2, 'pending')] }, NOW + MIN).finished).toBeNull()
+  })
+  test('a ▶ done line finishes with no to-do list', () => {
+    const s = applyParsed(base({ started_at: NOW - 10 * MIN }), parseText('▶ done all green', NOW), NOW)
+    expect(bandLine(s, NOW)).toBe('✅ Finished · took 10 min')
+  })
+  test('quiet after 10 minutes with nothing running; the percent stays', () => {
+    const s = six({ updated_at: NOW - 12 * MIN, alive_at: NOW - 12 * MIN })
+    expect(bandLine(s, NOW)).toBe('😴 Quiet for 12 min · 46% ▰▰▰▰▰▱▱▱▱▱')
+    expect(cardOf(s, NOW).pct).toBe('46%')
+  })
+  test('a running tool with a fresh heartbeat is not quiet', () => {
+    expect(stateOf(six({ updated_at: NOW - 30 * MIN, alive_at: NOW - 20_000, tool_now: { name: 'Bash', detail: '' } }), NOW)).not.toBe('quiet')
+  })
+  test('a stopped run says so', () => {
+    expect(bandLine(base({ started_at: NOW - 5 * MIN, finished: { at: NOW, verdict: 'ended: error', ok: false } }), NOW)).toBe('❌ Stopped · after 5 min')
+  })
+})
+
+describe('/builds text and history', () => {
+  test('runLines are plain text with no command', () => {
+    const lines = runLines(six({ tool_now: { name: 'Bash', detail: 'Running mutants' }, alive_at: NOW }), NOW)
+    expect(lines[0]).toBe('🧬 MOD-3  46%')
+    expect(lines.join('\n')).toContain('Phase 2: api server · mutant 30 of 40')
+  })
+  test('the history gives the first prompt, EXPECT, the to-do list, the markers and the running call', () => {
+    const s = recover(
+      base({ prompt_id: '—' }),
+      [
+        { role: 'user', text: 'MOD-3 · Builds\nMODEL: x EXPECT: 1 h' },
+        { role: 'assistant', text: '', toolUses: [{ tool: 'TaskCreate', input: { subject: 'One', description: '' }, result: { task: { id: '1', subject: 'One' } } }, { tool: 'TaskCreate', input: { subject: 'Two', description: '' }, result: { task: { id: '2', subject: 'Two' } } }] },
+        { role: 'assistant', text: '', toolUses: [{ tool: 'TaskUpdate', input: { taskId: '1', status: 'completed' }, result: { success: true } }, { tool: 'TaskUpdate', input: { taskId: '2', status: 'in_progress' }, result: { success: true } }] },
+        { role: 'assistant', text: '▶ mutant 1/2', toolUses: [{ tool: 'Bash', input: {} }] },
+      ],
+      NOW,
+    )
+    expect(s.prompt_id).toBe('MOD-3')
+    expect(s.expect_h).toBe(1)
+    expect(progressOf(s, NOW).pct).toBe(75)
+    expect(s.tool_now?.name).toBe('Bash')
+  })
+  test('with no history the title stays the folder', () => {
+    expect(titleOf(recover(base({ prompt_id: '—' }), [], NOW))).toBe('x · main')
+  })
+})
+
+describe('look', () => {
+  test('the little character exists for each state and says no "Need you"', () => {
+    for (const st of ['building', 'testing', 'mutation', 'quiet', 'done', 'failed'] as const) {
+      const svg = avatarSvg(st, '#1c7ed6')
+      expect(svg.startsWith('<svg')).toBe(true)
+      expect(svg).not.toContain('Need you')
+    }
+  })
+})
+
+describe('folder labels', () => {
+  const labels = parseFolderLabels('Work/project-a=main clone, Work/project-b=design clone')
+  test('a set label replaces the folder name', () => {
+    expect(folderName('/Users/tester/Work/project-a', labels)).toBe('main clone')
+    expect(folderName('/Users/tester/Work/project-b/', labels)).toBe('design clone')
+  })
+  test('with no label a folder shows its last part', () => {
+    expect(folderName('/Users/tester/Work/project-a', [])).toBe('project-a')
+    expect(folderName('/Users/tester/Work/project-c', labels)).toBe('project-c')
+    expect(parseFolderLabels('')).toEqual([])
+    expect(parseFolderLabels('junk')).toEqual([])
+  })
+})

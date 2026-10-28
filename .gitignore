@@ -1,0 +1,10 @@
+node_modules/
+.DS_Store
+**/.claude-plugin/types/
+*.log
+*.tmp
+.scratch/
+test-output/
+coverage/
+build-progress/REPORT*.md
+build-progress/preview-*.txt
