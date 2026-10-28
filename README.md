@@ -124,7 +124,7 @@ Done in the background
 ❌ Deploy preview · failed after 3 min
 ```
 
-Finished tasks stay in "Done in the background" for 10 minutes, then disappear. A task whose end is never reported shows `❔ … · no news for 2 h` after 2 hours and is no longer counted as running. After a reload the list is rebuilt from the session's history: a background call with no completion is running (its time is kept from the status file when there is one). The mod only watches; it never starts, stops or changes a task.
+Finished tasks stay in "Done in the background" for 10 minutes, then disappear. A task whose end is never reported shows `❔ … · no news for 2 h` after 2 hours and is no longer counted as running. After a reload the list is rebuilt from the session's history: a background call with no completion is running (its time is kept from the status file when there is one). The mod only watches; it never starts, stops or changes a task. `/builds-tasks` prints this session's background tasks with each one's start and the last notification seen for it (task id and status only), and any notification that named no listed task.
 
 ### Open, close, reopen
 
@@ -136,10 +136,12 @@ Finished tasks stay in "Done in the background" for 10 minutes, then disappear. 
 
 ### How % and time left are worked out
 
-- **%** comes from the session's own to-do list: (items done + the open item's `n/N`) ÷ items. The open item's `n/N` is the newest `▶ x n/N` marker. With no to-do list it uses the `▶ phase n/N` markers.
+- **%** comes from the session's own to-do list (TodoWrite, TaskCreate/TaskUpdate, or the desktop app's own task list, `update_plan`), read live and again from the history after a reload. It is shown whether or not the start is known: (items done + the open item's `n/N`) ÷ items. The open item's `n/N` is the newest `▶ x n/N` marker. With no to-do list it uses the `▶ phase n/N` markers.
 - **Time left** comes from the prompt header's `EXPECT: <hours> h` until the run is 10% done: `EXPECT − time running` (never below 5 min). It is then shown as "(from the estimate)".
 - From 10% done on, it uses the real speed: time running × (100 − %) ÷ %.
 - With no `EXPECT` line and under 10%, it says "time left not known yet".
+- When the start of the session is not known (a reload in a long run), the time left comes from the speed the mod has seen since it loaded: after at least 10 minutes watched and with the % moved, `about N min left (from the last N min)`. Before that, with an `EXPECT` line, `at most N min left (from the estimate)`; with neither, no time-left phrase is shown.
+- The plain `Working · N steps` form is used only when there is no to-do list at all.
 - "Running for N min" counts from the first prompt (or, in a session reloaded with history, from the session's launch).
 
 ### How to write a prompt so the panel shows it well

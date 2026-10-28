@@ -15,6 +15,8 @@ export type Bg = {
   ok: boolean | null
   /** `completed`, `failed` or `killed`, when it ended. */
   end: string | null
+  /** The status word of the last notification seen for it (id and status only). */
+  seen: string | null
 }
 /** One tool call: its name and its description or file name, never a command. `at` is 0 when a reload could not know. */
 export type Step = { name: string; detail: string; at: number }
@@ -59,6 +61,8 @@ export type Status = {
   steps: number
   /** The last 5 tool calls. */
   recent: Step[]
+  /** The first share of the work seen since the mod loaded; the speed for the time left is read from it. */
+  watch: { at: number; frac: number } | null
 }
 
 declare module 'claude-code' {

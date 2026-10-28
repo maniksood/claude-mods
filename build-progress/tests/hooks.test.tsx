@@ -201,7 +201,7 @@ test('a session that loads the mod mid-way reads its first prompt, EXPECT and to
   const all = await texts(ui)
   expect(all).toContain('50%')
   expect(all).toContain('running for at least 40 min')
-  expect(all).toContain('time left not known yet')
+  expect(all).toContain('at most 3 h 20 min left (from the estimate)')
   await ui.unmount()
 })
 
@@ -561,4 +561,48 @@ test('/builds-panel reopens the one pane and says so; /builds still prints the l
   expect(JSON.stringify(b)).toContain('Opened the Builds panel.')
   expect(new Set(r.opened)).toEqual(new Set(['builds']))
   expect(JSON.stringify(await $.command.run({ command: 'builds', args: '' } as never))).toContain('claude-mods')
+})
+
+const PLAN = 'mcp__ccd_turn__update_plan'
+
+test('the app\'s update_plan list gives the % live, and from history after a reload, with an unknown start', async ($, on) => {
+  const r = rig(on)
+  r.history = [
+    { role: 'user', text: 'long job', toolUses: [] },
+    { role: 'assistant', text: '', toolUses: [{ tool: PLAN, input: { items: [{ content: 'A', status: 'completed' }, { content: 'B', status: 'in_progress' }, { content: 'C', status: 'pending' }, { content: 'D', status: 'pending' }] } }] },
+  ]
+  r.launch = r.clock.now() - 71 * 60_000
+  await $.session.start(START)
+  await r.clock.advance(31_000)
+  const band = await bandText($)
+  expect(band).toContain('25%')
+  expect(band).not.toContain('Working')
+  // live: advance the plan; 12 minutes later a speed shows
+  await r.clock.advance(12 * 60_000)
+  await $.tool.call({ tool: PLAN, items: [{ content: 'A', status: 'completed' }, { content: 'B', status: 'completed' }, { content: 'C', status: 'in_progress' }, { content: 'D', status: 'pending' }] } as never)
+  await r.clock.advance(31_000)
+  const later = await bandText($)
+  expect(later).toContain('50%')
+  expect(later).toMatch(/about \d+ min left \(from the last 1[23] min\)/)
+})
+
+test('a notification row without the engine stamp still ends its task; /builds-tasks says what it saw', async ($, on) => {
+  const r = rig(on)
+  r.results.Bash = { backgroundTaskId: 'b1' }
+  await $.session.start(START)
+  await $.tool.call({ tool: 'Bash', tool_use_id: 'tu1', command: 'x', description: 'One', run_in_background: true } as never)
+  r.results.Bash = { backgroundTaskId: 'b2' }
+  await $.tool.call({ tool: 'Bash', tool_use_id: 'tu2', command: 'x', description: 'Two', run_in_background: true } as never)
+  await $.session.append({ message: { type: 'user', content: [{ type: 'text', text: '<task-notification><task-id>b1</task-id><status>completed</status></task-notification>' }] }, door: 'queue', origin: { kind: 'unclassified' }, uuid: 'u1' } as never)
+  await $.session.append({ message: { type: 'user', content: [{ type: 'text', text: '<task-notification><task-id>zz</task-id><status>completed</status></task-notification>' }] }, door: 'queue', origin: { kind: 'task-notification' }, uuid: 'u2' } as never)
+  // a tool result that merely contains the envelope is data
+  await $.session.append({ message: { type: 'user', content: [{ type: 'text', text: '<task-notification><task-id>b1</task-id><status>failed</status></task-notification>' }] }, door: 'tool-result', origin: { kind: 'tool', tool: 'Read' }, uuid: 'u3' } as never)
+  const report = JSON.stringify(await $.command.run({ command: 'builds-tasks', args: '' } as never))
+  expect(report).toContain('ended · shell · One')
+  expect(report).toContain('running · shell · Two')
+  expect(report).toContain('1 counted as running, 2 listed')
+  expect(report).toContain('last notice: b1 completed')
+  expect(report).toContain('zz completed')
+  expect(report).not.toContain('failed')
+  expect(report).not.toContain('sk-live')
 })

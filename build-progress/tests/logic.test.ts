@@ -6,6 +6,11 @@ import {
   ALL_DONE,
   applyParsed,
   applyTool,
+  applyPlan,
+  isPlanTool,
+  noticeBg,
+  bgReport,
+  watchOf,
   bandLine,
   bgLines,
   blankStatus,
@@ -336,8 +341,8 @@ describe('background tasks', () => {
     expect(bandLine(s, NOW)).not.toContain('in background')
   })
   test('a notification names its task and status; one without an end status names none', () => {
-    expect(parseNotice('<task-notification><task-id>b1</task-id><tool-use-id>tu1</tool-use-id><status>completed</status><summary>x</summary></task-notification>')).toEqual({ id: 'b1', toolUseId: 'tu1', status: 'completed' })
-    expect(parseNotice('<task-notification><task-id>m1</task-id><status>running</status></task-notification>')).toBeNull()
+    expect(parseNotice('<task-notification><task-id>b1</task-id><tool-use-id>tu1</tool-use-id><status>completed</status><summary>x</summary></task-notification>')).toEqual({ id: 'b1', toolUseId: 'tu1', status: 'completed', isEnd: true })
+    expect(parseNotice('<task-notification><task-id>m1</task-id><status>running</status></task-notification>')?.isEnd).toBe(false)
     expect(parseNotice('nothing here')).toBeNull()
   })
   test('a reload rebuilds from the history: an open background call runs, a finished one is gone', () => {
@@ -356,5 +361,98 @@ describe('background tasks', () => {
     const s = recover(base(), [{ role: 'user', text: 'go' }, { role: 'assistant', text: '', toolUses: [{ tool: 'Bash', tool_use_id: 't', input: { command: 'curl -H "Authorization: Bearer abc123abc123abc123abc123abc123abc123"', run_in_background: true }, result: { backgroundTaskId: 'b' } }] }], NOW)
     expect(JSON.stringify(s)).not.toContain('abc123')
     expect(s.bg[0]?.label).toBe('Background command')
+  })
+})
+
+describe('a checklist is always shown, and the time left when the start is unknown', () => {
+  const planned = (over: Partial<Status> = {}): Status => six({ start_known: false, ...over })
+  test('the % shows with an unknown start, and the plain Working form is not used', () => {
+    const line = bandLine(planned(), NOW)
+    expect(line).toContain('46%')
+    expect(line).not.toContain('Working')
+    expect(line).not.toContain('time left not known yet')
+  })
+  test('unknown start, no EXPECT, nothing watched: no time-left phrase at all', () => {
+    expect(bandLine(planned(), NOW)).toBe('🧬 46% ▰▰▰▰▰▱▱▱▱▱ · Phase 2: api server · mutant 30/40')
+  })
+  test('unknown start with EXPECT: "at most", from the at-least elapsed', () => {
+    expect(bandLine(planned({ expect_h: 1 }), NOW)).toContain('at most 34 min left (from the estimate)')
+  })
+  test('watched under 10 minutes: not yet a speed', () => {
+    const s = planned({ watch: { at: NOW - 9 * MIN, frac: 0.2 } })
+    expect(bandLine(s, NOW)).not.toContain('from the last')
+  })
+  test('watched 12 min and the % moved from 20% to ~46%: about N min left from the last 12 min', () => {
+    const s = planned({ watch: { at: NOW - 12 * MIN, frac: 0.2 } })
+    const frac = 2.75 / 6
+    const left = ((1 - frac) / ((frac - 0.2) / 12))
+    expect(bandLine(s, NOW)).toContain(`about ${Math.round(left)} min left (from the last 12 min)`)
+  })
+  test('watched 15 min but the % has not moved: no speed', () => {
+    const s = planned({ watch: { at: NOW - 15 * MIN, frac: 2.75 / 6 } })
+    expect(bandLine(s, NOW)).not.toContain('from the last')
+  })
+  test('the speed is only for an unknown start: a known one keeps elapsed × (100 − %) ÷ %', () => {
+    expect(bandLine(six({ watch: { at: NOW - 12 * MIN, frac: 0.2 } }), NOW)).toContain('about 31 min left')
+  })
+  test('the baseline is the first share seen, rebased when the share falls', () => {
+    const a = watchOf(six(), NOW)
+    expect(Math.abs((a.watch?.frac ?? 0) - 2.75 / 6)).toBeLessThan(1e-9)
+    expect(watchOf(a, NOW + MIN)).toBe(a)
+    const grown = watchOf({ ...a, tasks: [...a.tasks, task(7, 'pending'), task(8, 'pending')] }, NOW + 2 * MIN)
+    expect(grown.watch?.at).toBe(NOW + 2 * MIN)
+    expect(watchOf(base(), NOW).watch).toBeNull()
+  })
+  test('the app\'s update_plan list is a checklist: items, advance, done, start', () => {
+    expect(isPlanTool('mcp__ccd_turn__update_plan')).toBe(true)
+    expect(isPlanTool('update_plan')).toBe(true)
+    expect(isPlanTool('TodoWrite')).toBe(false)
+    let t = applyPlan([], { items: [{ content: 'A', status: 'in_progress' }, { content: 'B', status: 'pending' }, { content: 'C', status: 'pending' }] })
+    expect(t.map(x => x.status)).toEqual(['in_progress', 'pending', 'pending'])
+    t = applyPlan(t, { advance: true })
+    expect(t.map(x => x.status)).toEqual(['completed', 'in_progress', 'pending'])
+    t = applyPlan(t, { done: [2], start: 3 })
+    expect(t.map(x => x.status)).toEqual(['completed', 'completed', 'in_progress'])
+  })
+  test('a reload recovers the update_plan list from history, with the % shown and a started-unknown start', () => {
+    const rows = [
+      { role: 'user', text: 'go' },
+      { role: 'assistant', text: '', toolUses: [{ tool: 'mcp__ccd_turn__update_plan', input: { items: [{ content: 'A', status: 'in_progress' }, { content: 'B', status: 'pending' }] } }] },
+      { role: 'assistant', text: '', toolUses: [{ tool: 'mcp__ccd_turn__update_plan', input: { advance: true } }] },
+    ]
+    const s = recover(base({ start_known: false }), rows, NOW)
+    expect(s.tasks.map(t => t.status)).toEqual(['completed', 'in_progress'])
+    expect(bandLine(s, NOW)).toContain('50%')
+  })
+  test('with 8 background tasks and a checklist the band shows both', () => {
+    let s = planned()
+    for (let i = 0; i < 8; i++) s = startBg(s, { id: `b${i}`, toolUseId: '', kind: 'shell', label: 'x' }, NOW)
+    expect(bandLine(s, NOW).startsWith('🔄 8 in background · 🧬 46%')).toBe(true)
+  })
+})
+
+describe('reading a notification', () => {
+  const env = (inner: string) => `<task-notification>${inner}</task-notification>`
+  test('matches by task id, by tool-use id, or a task-id that is the call id', () => {
+    const s = startBg(startBg(base(), { id: 'b1', toolUseId: 'tu1', kind: 'shell', label: 'One' }, NOW), { id: 'tu2', toolUseId: 'tu2', kind: 'shell', label: 'Two' }, NOW)
+    const a = noticeBg(s, parseNotice(env('<task-id>b1</task-id><status>completed</status>'))!, NOW)
+    const b = noticeBg(a.status, parseNotice(env('<tool-use-id>tu2</tool-use-id><status>failed</status>'))!, NOW)
+    const c = noticeBg(startBg(base(), { id: 'tu9', toolUseId: 'tu9', kind: 'shell', label: 'Three' }, NOW), parseNotice(env('<task-id>tu9</task-id><status>killed</status>'))!, NOW)
+    expect(a.status.bg.map(x => x.ended_at !== null)).toEqual([true, false])
+    expect(b.status.bg.map(x => x.ended_at !== null)).toEqual([true, true])
+    expect(c.status.bg[0]?.end).toBe('killed')
+  })
+  test('tags with spaces and line breaks around the values, and extra tags, still read', () => {
+    const n = parseNotice(env('\n  <task-id>\n b7 \n</task-id>\n  <output-file>/x/y</output-file>\n  <status> completed </status>\n  <summary>Background command "x" completed (exit code 0)</summary>\n'))
+    expect(n).toEqual({ id: 'b7', status: 'completed', isEnd: true })
+  })
+  test('a progress notice does not end the task but is remembered for /builds-tasks', () => {
+    const s = startBg(base(), { id: 'm1', toolUseId: '', kind: 'monitor', label: 'Watch' }, NOW)
+    const r = noticeBg(s, parseNotice(env('<task-id>m1</task-id><status>running</status>'))!, NOW)
+    expect(r.status.bg[0]?.ended_at).toBeNull()
+    expect(bgReport(r.status, [], NOW)).toContain('last notice: m1 running')
+  })
+  test('an unknown task id is reported as unknown', () => {
+    expect(noticeBg(base(), parseNotice(env('<task-id>zz</task-id><status>completed</status>'))!, NOW).isKnown).toBe(false)
   })
 })

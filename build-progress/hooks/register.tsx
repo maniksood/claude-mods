@@ -13,9 +13,11 @@ import {
   TURN_ENDED,
   addStep,
   applyParsed,
+  applyPlan,
   applyTool,
   bandLine,
   bgFromCall,
+  bgReport,
   bgRunning,
   blankStatus,
   branchFromHead,
@@ -24,6 +26,8 @@ import {
   endBg,
   expectFrom,
   homeShown,
+  isPlanTool,
+  noticeBg,
   normalize,
   parseNotice,
   parseText,
@@ -37,6 +41,7 @@ import {
   startBg,
   toolNow,
   visibleRuns,
+  watchOf,
 } from './logic'
 
 const PANE = 'builds'
@@ -56,6 +61,8 @@ let status: Status | null = null
 let lastWrite = 0
 let isScheduled = false
 let hasPrompt = false
+/** The last notifications that named no listed task, as `id status`; for /builds-tasks. */
+let lost: string[] = []
 
 /** This session's own file is only for `/builds`; the pane and the band read the in-memory copy. */
 const writeNow = async ($: Eng): Promise<void> => {
@@ -75,7 +82,7 @@ const writeNow = async ($: Eng): Promise<void> => {
 const change = async ($: Eng, fn: (s: Status) => Status, touch = true): Promise<void> => {
   if (!status) return
   const now = await $.clock.now()
-  status = settle(fn(touch ? { ...status, updated_at: now, alive_at: now } : status), now)
+  status = watchOf(settle(fn(touch ? { ...status, updated_at: now, alive_at: now } : status), now), now)
   const wait = lastWrite + WRITE_EVERY_MS - now
   if (wait <= 0) {
     await writeNow($)
@@ -170,8 +177,11 @@ export const register: Register = (on, options) => {
     } catch {
       // no earlier file
     }
+    status = watchOf({ ...status, watch: null }, now)
+    lost = []
     await writeNow($)
     await $.command.register({ name: 'builds', description: 'List every Claude Code session and its progress' })
+    await $.command.register({ name: 'builds-tasks', description: 'List this session\'s background tasks and the last notification seen for each' })
     await $.command.register({ name: 'builds-panel', description: 'Open the Builds panel' })
     void $.ui.open({ id: PANE, title: 'Builds' })
     void update($, nowAtom, () => now)
@@ -201,6 +211,9 @@ export const register: Register = (on, options) => {
 
     return { text }
   })
+
+  // This session only: why each background task is still counted, from the ids and status words alone.
+  on('command.run', { command: 'builds-tasks' }, async $ => ({ text: status ? bgReport(status, lost, await $.clock.now()) : 'No session yet.' }))
 
   // same pane id: opening it again re-seats the one pane, never a second
   on('command.run', { command: 'builds-panel' }, async $ => {
@@ -252,13 +265,22 @@ export const register: Register = (on, options) => {
 
   // A background task ends with a notification row: its id and status are read from the envelope, nothing else.
   on('session.append', async ($, e, next) => {
-    if (!e.agentId && e.origin.kind === 'task-notification') {
-      const content: unknown = e.message.content
-      const text = typeof content === 'string' ? content : (Array.isArray(content) ? content : []).flatMap(b => (b && typeof b === 'object' && 'text' in b ? [String(b.text)] : [])).join('\n')
+    const content: unknown = e.message.content
+    const text = typeof content === 'string' ? content : (Array.isArray(content) ? content : []).flatMap(b => (b && typeof b === 'object' && 'text' in b ? [String(b.text)] : [])).join('\n')
+    // the engine's stamp, or a user/attachment row that opens with the envelope (never a tool result, whose text is data)
+    const isNotice = e.origin.kind === 'task-notification' || (e.door !== 'tool-result' && e.message.type !== 'assistant' && text.trimStart().startsWith('<task-notification'))
+    if (!e.agentId && isNotice) {
       const notice = parseNotice(text)
       if (notice) {
         const now = await $.clock.now()
-        await change($, s => endBg(s, notice, notice.status, now))
+        let isKnown = true
+        await change($, s => {
+          const r = noticeBg(s, notice, now)
+          isKnown = r.isKnown
+
+          return r.status
+        })
+        if (!isKnown) lost = [...lost, `${notice.id ?? notice.toolUseId} ${notice.status}`].slice(-5)
       }
     }
 
@@ -277,13 +299,13 @@ export const register: Register = (on, options) => {
     const ran = await next(e)
     const isDenied = 'deny' in ran && !!ran.deny
     // the session's to-do list is carried by these three tools' calls
-    const isList = TASK_TOOLS.includes(e.tool) && !isDenied
+    const isList = (TASK_TOOLS.includes(e.tool) || isPlanTool(e.tool)) && !isDenied
     const endedAt = await $.clock.now()
     // a background command or monitor is told by its call's result; the task's end comes later, from its notification
     const started = isDenied ? null : bgFromCall(e.tool, e, ran.result, e.tool_use_id ?? '')
     const stopped = !isDenied && e.tool === 'TaskStop' && typeof e.task_id === 'string' ? e.task_id : ''
     await change($, s => {
-      let out: Status = { ...s, tool_now: null, tool_since: null, tasks: isList ? applyTool(s.tasks, e.tool, e, ran.result) : s.tasks }
+      let out: Status = { ...s, tool_now: null, tool_since: null, tasks: isList ? (isPlanTool(e.tool) ? applyPlan(s.tasks, e) : applyTool(s.tasks, e.tool, e, ran.result)) : s.tasks }
       if (started) out = startBg(out, started, endedAt)
       if (stopped) out = endBg(out, { id: stopped }, 'killed', endedAt)
 
@@ -375,7 +397,7 @@ export const register: Register = (on, options) => {
         </Box>
         {c.pct !== '' && <Text bold>{c.pct}</Text>}
         {c.bar !== '' && <Text>{c.bar}</Text>}
-        <Text>{c.end ?? c.left}</Text>
+        {(c.end ?? c.left) !== '' && <Text>{c.end ?? c.left}</Text>}
         <Text dimColor>{c.running}</Text>
         {c.work !== '' && <Text bold>{c.work}</Text>}
         {c.doing !== '' && <Text>{c.doing}</Text>}
