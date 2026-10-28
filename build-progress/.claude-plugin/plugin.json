@@ -1,6 +1,6 @@
 {
   "name": "build-progress",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "Shows this session's progress: % done, time left and what it is doing",
   "types": "./types/index.d.ts",
   "author": {

@@ -116,11 +116,11 @@ On the desktop app the character is a small animated figure; in a terminal it is
 
 Each task is one row with its description only (a Bash call's `description`, an agent's description, a monitor's description), never the command. Finished tasks stay in "Done in the background" for 10 minutes, then disappear. A task whose end is never reported shows `❔ … · no news for 2 h` after 2 hours and is no longer counted as running.
 
-How the mod knows a task ended: the app writes a "finished" row (an `attachment` row of kind `queued_command` that opens with a `<task-notification>` envelope holding `<task-id>` and `<status>`). The mod reads that row live. It also reads the session's transcript file with `grep` (ids, status words and clock times only; no message text is kept) when the session starts and about once a minute while a task runs, so a notice it missed, or one that came before a reload, still ends the task, and each task shows **its own start time**, not the time of the reload. The same read gives the session's name.
+How the mod knows a task ended: the app writes a "finished" row (an `attachment` row of kind `queued_command` that opens with a `<task-notification>` envelope holding `<task-id>` and `<status>`). The mod reads that row live. It also reads the session's transcript file with `grep` (ids, status words and clock times only; no message text is kept) when the session starts and about once a minute while a task runs, so a notice it missed, or one that came before a reload, still ends the task, and each task shows **its own start time**, not the time of the reload. The same read gives the session's name. The transcript is looked for under the app's own folder: `CLAUDE_CONFIG_DIR` when it is set, else `~/.claude`. A monitor's notices carry no status word: one that reaches its own time limit (`timeoutMs`) is ended there, as `timed out`. A reloaded session whose last turn had ended shows **Finished**, timed from the last turn's end row (or a later task end), when nothing still runs.
 
 How a task's % is found: a background agent from its own checklist (`TodoWrite`, `update_plan`, `TaskCreate`) and its `▶ x n/N` lines; a background command from the **last lines of its output file** (the app's `tasks/<id>.output`), read only to find a `▶ x n/N` marker, an `NN%` figure or an `N min left` / `ETA hh:mm` line. The output itself is never shown or stored. A task that prints none of these shows `no % reported`.
 
-The mod only watches; it never starts, stops or changes a task. `/builds-tasks` prints this session's background tasks with each one's start, its matched end (time and status word), and the last notification seen for it (task id and status only), and any notification that named no listed task.
+The mod only watches; it never starts, stops or changes a task. `/builds-tasks` prints this session's background tasks with each one's start, its matched end (time and status word), and the last notification seen for it (task id and status only), and any notification that named no listed task. After a reload it also lists the tasks that had already ended, and says for each end whether it was read from the replayed history or the transcript file.
 
 ### Open, close, reopen
 
@@ -147,7 +147,7 @@ The mod only watches; it never starts, stops or changes a task. `/builds-tasks` 
 **Overall time left**: the longest of the main run's and every running task's. **Overall %**: the main run's % while it works; once its checklist is done and only background tasks run, the average % of the tasks that report one; never 100% while anything runs.
 
 - The plain `Working · N steps` form is used only when there is no to-do list at all.
-- "Running for N min" counts from the first prompt (or, in a session reloaded with history, from the session's launch).
+- "Running for N min" counts from the first prompt (or, in a session reloaded with history, from the transcript's first row, else the session's launch).
 
 ### How to make your runs show well
 

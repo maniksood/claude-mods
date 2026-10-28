@@ -32,6 +32,7 @@ import {
   parseHist,
   scanProgress,
   setBgProgress,
+  type Found,
   type Hist,
   homeShown,
   isPlanTool,
@@ -40,7 +41,7 @@ import {
   parseNotice,
   parseText,
   promptIdFrom,
-  recover,
+  recoverAll,
   roleFrom,
   runLines,
   scrub,
@@ -71,24 +72,36 @@ let isScheduled = false
 let hasPrompt = false
 /** The last notifications that named no listed task, as `id status`; for /builds-tasks. */
 let lost: string[] = []
+/** The tasks that ended before the last reload, and where each end was read; for /builds-tasks. */
+let found: Found[] = []
+/** What the last reload read from the history (counts and whether the file was found); for /builds-tasks. */
+let histNote = ''
 
 /** A background agent's own checklist, by its agent id; for its %. */
 const agentTasks = new Map<string, Task[]>()
 let sessionId = ''
 let cwdNow = ''
 let homeDir = ''
+let configDir = ''
 let tasksDir: string | null = null
 let isReconciling = false
 let beats = 0
 
-/** Where the transcript is: the folder is the working directory with every character outside letters, digits and `-` turned into `-`. */
-const transcriptPath = (): string => `${homeDir}/.claude/projects/${cwdNow.replace(/[^A-Za-z0-9-]/g, '-')}/${sessionId}.jsonl`
+/** Where the transcript may be: under the app's own folder (`CLAUDE_CONFIG_DIR`, else `~/.claude`), in the folder named for the working directory with every character outside letters, digits and `-` turned into `-`. */
+const transcriptPaths = (): string[] =>
+  [...new Set([configDir, `${homeDir}/.claude`].filter(d => d !== ''))].map(d => `${d}/projects/${cwdNow.replace(/[^A-Za-z0-9-]/g, '-')}/${sessionId}.jsonl`)
 
 /** The transcript's ids, status words, clock times and the session's name, found with `grep`; null when it cannot be read. Nothing else is taken from it. */
 const loadHist = async ($: Eng): Promise<Hist | null> => {
   try {
-    const path = transcriptPath()
-    if (!(await $.fs.exists(path))) return null
+    let path = ''
+    for (const p of transcriptPaths()) {
+      if (await $.fs.exists(p)) {
+        path = p
+        break
+      }
+    }
+    if (!path) return null
     const r = await $.process.run(['grep', '-noE', HIST_PATTERN, path], { timeoutMs: 30_000 })
     if (r.exitCode > 1) return null
 
@@ -141,7 +154,8 @@ const reconcile = async ($: Eng): Promise<void> => {
   isReconciling = true
   try {
     const hist = await loadHist($)
-    if (hist) await change($, s => applyHist(s, hist), false)
+    const now = await $.clock.now()
+    if (hist) await change($, s => applyHist(s, hist, now), false)
     await scanOutputs($)
   } finally {
     isReconciling = false
@@ -212,6 +226,7 @@ export const register: Register = (on, options) => {
     const sid = await $.session.id()
     const cwd = await $.session.cwd()
     const home = await $.env.get('HOME').catch(() => undefined)
+    const config = await $.env.get('CLAUDE_CONFIG_DIR').catch(() => undefined)
     dir = `${home ?? ''}/.claude/build-progress`
     let branch = '—'
     try {
@@ -231,11 +246,14 @@ export const register: Register = (on, options) => {
     sessionId = sid
     cwdNow = cwd
     homeDir = home ?? ''
+    configDir = config ?? ''
     tasksDir = null
     agentTasks.clear()
     status = blankStatus(sid, scrub(homeShown(cwd, home), 120), branch, now)
     const hist = await loadHist($)
     hasPrompt = false
+    found = []
+    histNote = ''
     try {
       // the session's own history: its first prompt (id, EXPECT), its to-do list, its markers
       const rows = await $.session.messages()
@@ -243,7 +261,11 @@ export const register: Register = (on, options) => {
         hasPrompt = true
         // the history carries no clock; the session's launch is the nearest stamp to its first prompt
         const launch = (await $.session.usage()).startedAt
-        status = recover({ ...status, started_at: Number.isFinite(launch) ? launch : now }, rows, now, hist)
+        const got = recoverAll({ ...status, started_at: Number.isFinite(launch) ? launch : now }, rows, now, hist)
+        status = got.status
+        found = got.ended
+        const byReplay = found.filter(f => f.from === 'replay').length
+        histNote = `At the reload: ${rows.length} messages replayed, ${byReplay} task end${byReplay === 1 ? '' : 's'} in them; ${hist ? `the transcript file gave ${found.length - byReplay} more` : 'the transcript file could not be read'}.`
       }
     } catch {
       // no history to read: the title stays the folder
@@ -262,7 +284,7 @@ export const register: Register = (on, options) => {
         status = { ...status, report: old.report, title: status.title || old.title }
         status = { ...status, bg: [...known, ...recent] }
         if (old.start_known) status = { ...status, started_at: old.started_at, start_known: true }
-        else if (old.started_at < status.started_at) status = { ...status, started_at: old.started_at }
+        else if (!status.start_known && old.started_at < status.started_at) status = { ...status, started_at: old.started_at }
         if (status.finished?.untimed && old.finished && !old.finished.untimed && old.finished.verdict !== ALL_DONE) {
           status = { ...status, finished: { ...old.finished, verdict: old.finished.verdict === SESSION_CLOSED ? TURN_ENDED : old.finished.verdict } }
         }
@@ -270,7 +292,7 @@ export const register: Register = (on, options) => {
     } catch {
       // no earlier file
     }
-    if (hist) status = applyHist(status, hist)
+    if (hist) status = applyHist(status, hist, now)
     status = watchOf({ ...status, watch: null, tasks_at: now }, now)
     lost = []
     await writeNow($)
@@ -310,7 +332,7 @@ export const register: Register = (on, options) => {
   })
 
   // This session only: why each background task is still counted, from the ids and status words alone.
-  on('command.run', { command: 'builds-tasks' }, async $ => ({ text: status ? bgReport(status, lost, await $.clock.now()) : 'No session yet.' }))
+  on('command.run', { command: 'builds-tasks' }, async $ => ({ text: status ? [bgReport(status, lost, await $.clock.now(), found), histNote].filter(Boolean).join('\n') : 'No session yet.' }))
 
   // same pane id: opening it again re-seats the one pane, never a second
   on('command.run', { command: 'builds-panel' }, async $ => {

@@ -1,20 +1,22 @@
 import { expect, mock, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
 
+import { HIST_PATTERN } from '../hooks/logic'
+
 const HOME = '/Users/tester'
 const DIR = `${HOME}/.claude/build-progress`
 
 type Rig = { ask: boolean; results: Record<string, unknown>; history: unknown[]; launch: number; files: Map<string, string>; toasts: string[]; sounds: string[]; snaps: string[]; opened: string[]; writes: number; settle: boolean; hold: number; clock: ReturnType<typeof mock.clock> }
 type On = Parameters<typeof mock.session>[0]
 
-const rig = (on: On, sid = 's1'): Rig => {
+const rig = (on: On, sid = 's1', env: Record<string, string> = {}): Rig => {
   const files = new Map<string, string>()
   const toasts: string[] = []
   const sounds: string[] = []
   const snaps: string[] = []
   const r = { ask: false, results: {} as Record<string, unknown>, history: [] as unknown[], launch: 0, files, toasts, sounds, snaps, opened: [] as string[], writes: 0, settle: true, hold: 0, clock: undefined as never } as Rig
   const clock = mock.clock(on)
-  mock.env(on, { HOME })
+  mock.env(on, { HOME, ...env })
   on('session.id', () => ({ value: sid }))
   on('session.cwd', () => ({ value: `${HOME}/Work/claude-mods` }))
   on('fs.read', (_, e) => {
@@ -719,4 +721,123 @@ test('a background agent\'s own checklist gives its %', async ($, on) => {
   await $.session.append({ door: 'response', agentId: 'agent-1', message: { type: 'assistant', content: [{ type: 'text', text: '▶ page 3/4' }] } } as never)
   await r.clock.advance(5000)
   expect(mine(r).bg[0]).toMatchObject({ pct: 75 })
+})
+
+// MOD-9: a session reloaded after it finished. The rows below have the real shapes of a saved session (keys, order, tags, status
+// words, times); every text is a placeholder. The replay carries no clock and none of the end notices: those came as attachment rows.
+const RELOAD_AT = Date.parse('2026-10-28T09:06:36.278Z')
+/** A real clock time of that session, moved to the same distance before the test clock's reload. */
+const at = (T: number, hms: string): string => new Date(T - (RELOAD_AT - Date.parse(`2026-10-28T${hms}Z`))).toISOString()
+const BASE = { userType: 'external', entrypoint: 'cli', cwd: `${HOME}/Work/claude-mods`, sessionId: 's1', version: '2.1.308', gitBranch: 'main', slug: 'placeholder-slug' }
+type Job = { id: string; kind: 'shell' | 'agent' | 'monitor'; start: string; end: string | null }
+const JOBS: Job[] = [
+  { id: 'btqzqipzg', kind: 'shell', start: '06:34:37.674', end: '06:36:56.987' },
+  { id: 'b6eiyxtkm', kind: 'shell', start: '06:38:48.199', end: '06:41:55.203' },
+  { id: 'a95d229e6b528b334', kind: 'agent', start: '06:40:04.134', end: '06:51:44.084' },
+  { id: 'adf03c42f4cbfb594', kind: 'agent', start: '06:40:04.137', end: '06:46:29.071' },
+  { id: 'b9iyoipb2', kind: 'shell', start: '06:40:15.209', end: '06:52:08.469' },
+  { id: 'b1aa5w9tx', kind: 'monitor', start: '06:42:38.747', end: '06:52:11.365' },
+  { id: 'bri19rihe', kind: 'monitor', start: '06:44:53.680', end: null },
+  { id: 'a9cc7068508fff782', kind: 'agent', start: '06:57:17.462', end: '06:59:07.242' },
+  { id: 'a80c120b6bc1d197c', kind: 'agent', start: '07:03:56.573', end: '07:06:13.441' },
+  { id: 'b1x7rq8pn', kind: 'shell', start: '07:28:55.578', end: '07:28:55.990' },
+  { id: 'bf7mvch33', kind: 'monitor', start: '07:29:00.842', end: null },
+]
+const toolUseResult = (j: Job) =>
+  j.kind === 'shell'
+    ? { stdout: '', stderr: '', interrupted: false, isImage: false, noOutputExpected: false, backgroundTaskId: j.id, backgroundCwdHint: '…' }
+    : j.kind === 'agent'
+      ? { isAsync: true, status: 'async_launched', agentId: j.id, description: '…', resolvedModel: '…', prompt: '…', outputFile: '…', canReadOutputFile: true, canContinueAgent: true }
+      : { taskId: j.id, timeoutMs: 1800000, persistent: false }
+const envelope = (id: string, status: string | null) =>
+  status === null
+    ? `<task-notification>\n<task-id>${id}</task-id>\n<summary>…</summary>\n<event>…</event>\n</task-notification>`
+    : `<task-notification>\n<task-id>${id}</task-id>\n<tool-use-id>toolu_${id}</tool-use-id>\n<output-file>…</output-file>\n<status>${status}</status>\n<summary>…</summary>\n</task-notification>`
+/** The transcript file: a launch row per task, the three rows of each end notice, a monitor's last event, the turn's end, two slash commands. */
+const transcript = (T: number, jobs: Job[], turnEnd: string): string[] => {
+  const rows: Array<[string, object]> = [['06:05:27.235', { parentUuid: null, isSidechain: false, promptId: 'p', type: 'user', message: { role: 'user', content: '…' }, uuid: 'u', timestamp: '', ...BASE }]]
+  for (const j of jobs) {
+    rows.push([j.start, { parentUuid: 'u', isSidechain: false, promptId: 'p', type: 'user', message: { role: 'user', content: [{ tool_use_id: `toolu_${j.id}`, type: 'tool_result', content: '…' }] }, uuid: 'u', timestamp: '', toolUseResult: toolUseResult(j), sourceToolAssistantUUID: 'u', ...BASE }])
+    const end = j.end
+    if (end) {
+      const body = envelope(j.id, 'completed')
+      rows.push([end, { type: 'queue-operation', operation: 'enqueue', timestamp: '', sessionId: 's1', content: body }])
+      rows.push([end, { parentUuid: 'u', isSidechain: false, attachment: { type: 'queued_command', prompt: body, source_uuid: 'u', delivery_id: 'd', commandMode: 'task-notification', origin: { kind: 'task-notification', producer: '…' }, timestamp: at(T, end) }, type: 'attachment', uuid: 'u', timestamp: '', rendered: [{ content: `<system-reminder>${body}</system-reminder>` }], renderedRole: 'system', ...BASE }])
+      rows.push([end, { type: 'queue-operation', operation: 'remove', timestamp: '', sessionId: 's1', content: body, reason: '…', commandUuid: 'u', deliveryId: 'd' }])
+    } else if (j.kind === 'monitor') {
+      // a monitor's notices are events with no status word; the last one comes at its time limit
+      rows.push([j.start, { parentUuid: 'u', isSidechain: false, promptId: 'p', type: 'user', message: { role: 'user', content: envelope(j.id, null) }, uuid: 'u', timestamp: '', origin: { kind: 'task-notification', producer: '…' }, ...BASE }])
+    }
+  }
+  rows.push(['', { type: 'api-request-blob', sessionId: 's1', hash: 'h', message: { role: 'system', content: [{ type: 'text', text: envelope('btqzqipzg', 'failed') }] } }])
+  rows.push([turnEnd, { parentUuid: 'u', isSidechain: false, message: { type: 'message', role: 'assistant', content: [{ type: 'text', text: '…' }], stop_reason: 'end_turn' }, type: 'assistant', uuid: 'u', timestamp: '', ...BASE }])
+  rows.push([turnEnd, { parentUuid: 'u', isSidechain: false, type: 'system', subtype: 'turn_duration', durationMs: 112935, messageCount: 24, timestamp: '', uuid: 'u', isMeta: false, ...BASE }])
+  rows.push(['09:05:50.588', { parentUuid: 'u', isSidechain: false, type: 'user', message: { role: 'user', content: '<command-name>/reload-plugins</command-name>' }, isMeta: false, timestamp: '', ...BASE }])
+  rows.push(['09:05:50.588', { parentUuid: 'u', isSidechain: false, type: 'system', subtype: 'local_command', content: '<local-command-stdout>…</local-command-stdout>', level: 'info', timestamp: '', uuid: 'u', isMeta: false, ...BASE }])
+
+  return rows.map(([hms, o]) => JSON.stringify(o).replace('"timestamp":""', hms ? `"timestamp":"${at(T, hms)}"` : '"x":""'))
+}
+/** What `grep -noE HIST_PATTERN` prints for those lines. */
+const grepOf = (lines: string[]): string =>
+  lines.flatMap((l, i) => [...l.matchAll(new RegExp(HIST_PATTERN, 'g'))].map(m => `${i + 1}:${m[0]}`)).join('\n')
+/** The replayed history: the prompt, each launch as a tool use with its result, a monitor event that opened a turn, the final answer, the slash commands. */
+const replay = (jobs: Job[]) => [
+  { role: 'user', text: '# FNR3B …' },
+  ...jobs.flatMap(j => [
+    { role: 'assistant', text: '', toolUses: [{ tool: j.kind === 'shell' ? 'Bash' : j.kind === 'agent' ? 'Agent' : 'Monitor', tool_use_id: `toolu_${j.id}`, input: { description: `Task ${j.id}`, ...(j.kind === 'monitor' ? {} : { run_in_background: true }) }, result: toolUseResult(j), text: '…' }] },
+    { role: 'user', text: '', toolResults: [{ tool_use_id: `toolu_${j.id}`, text: '…', isError: false }] },
+  ]),
+  ...jobs.filter(j => j.kind === 'monitor' && j.end === null).map(j => ({ role: 'user', text: envelope(j.id, null) })),
+  { role: 'assistant', text: '…', toolUses: [] },
+  { role: 'user', text: '<local-command-caveat>…</local-command-caveat>' },
+  { role: 'user', text: '<command-name>/reload-plugins</command-name>\n<command-message>reload-plugins</command-message>\n<command-args></command-args>' },
+  { role: 'user', text: '<local-command-stdout>…</local-command-stdout>' },
+]
+const reloadWith = (on: On, r: Rig, path: string, lines: string[], jobs: Job[]) => {
+  on('fs.exists', (_, e) => ({ value: e.path === path }))
+  on('process.run', (_, e) => ({ value: { exitCode: e.argv[0] === 'grep' && e.argv[3] === path ? 0 : 1, stdout: e.argv[0] === 'grep' && e.argv[3] === path ? grepOf(lines) : '', stderr: '' } as never }))
+  r.history = replay(jobs)
+  r.launch = Date.parse(at(r.clock.now(), '06:05:27.235'))
+}
+
+test('MOD-9: a finished session with 11 ended tasks reloads as Finished, 0 in background, each end read from the transcript file under CLAUDE_CONFIG_DIR', async ($, on) => {
+  const r = rig(on, 's1', { CLAUDE_CONFIG_DIR: `${HOME}/.claude-personal` })
+  const T = r.clock.now()
+  const path = `${HOME}/.claude-personal/projects/-Users-tester-Work-claude-mods/s1.jsonl`
+  reloadWith(on, r, path, transcript(T, JOBS, '08:13:36.924'), JOBS)
+  await $.session.start(START)
+  await r.clock.advance(5000)
+  const band = await bandText($)
+  expect(band).toContain('✅ Finished')
+  expect(band).toContain('took 2 h 8 min')
+  expect(band).not.toContain('at least')
+  expect(band).not.toContain('in background')
+  expect(band).not.toContain('Working')
+  expect(mine(r)).toMatchObject({ started_at: Date.parse(at(T, '06:05:27.235')), start_known: true, finished: { at: Date.parse(at(T, '08:13:36.924')), ok: true } })
+  const out = JSON.stringify(await $.command.run({ command: 'builds-tasks', args: '' } as never))
+  expect(out).toContain('0 counted as running, 0 listed, 11 more ended before the reload.')
+  for (const j of JOBS) expect(out).toContain(`id ${j.id}`)
+  expect(out.match(/end read from the transcript file/g)?.length).toBe(11)
+  expect(out.match(/\(completed\)/g)?.length).toBe(9)
+  expect(out.match(/\(timed out\)/g)?.length).toBe(2)
+  expect(out).not.toContain('no news')
+  expect(out).toContain('the transcript file gave 11 more')
+  expect(out).not.toContain('…')
+})
+
+test('MOD-9: a session with one really running task reloads with 1 in background, started at its own time', async ($, on) => {
+  const r = rig(on)
+  const T = r.clock.now()
+  const path = `${HOME}/.claude/projects/-Users-tester-Work-claude-mods/s1.jsonl`
+  // the last shell has no end row yet, the monitor is still inside its 30 minutes, the others ended
+  const jobs: Job[] = [...JOBS.slice(0, 9), { id: 'b1x7rq8pn', kind: 'shell', start: '08:50:00.000', end: null }, { id: 'bf7mvch33', kind: 'monitor', start: '07:29:00.842', end: null }]
+  reloadWith(on, r, path, transcript(T, jobs, '08:51:10.000'), jobs)
+  await $.session.start(START)
+  await r.clock.advance(5000)
+  const run = (mine(r).bg as Array<{ id: string; started_at: number; ended_at: number | null }>).filter(b => b.ended_at === null)
+  expect(run.map(b => [b.id, b.started_at])).toEqual([['b1x7rq8pn', Date.parse(at(T, '08:50:00.000'))]])
+  expect(await bandText($)).toContain('⏳ Waiting on 1 background task')
+  const out = JSON.stringify(await $.command.run({ command: 'builds-tasks', args: '' } as never))
+  expect(out).toContain('1 counted as running')
+  expect(out).toMatch(/running · shell · Task b1x7rq8pn · id b1x7rq8pn · started \d\d:\d\d · last notice: none/)
 })

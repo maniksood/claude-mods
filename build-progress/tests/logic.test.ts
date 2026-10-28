@@ -646,7 +646,7 @@ describe('0.5.0: what the transcript says', () => {
     const h = parseHist(grep)
     let s = startBg(startBg(base(), { id: 'bsh1', toolUseId: '', kind: 'shell', label: 'Sample' }, NOW), { id: 'aag1', toolUseId: '', kind: 'agent', label: 'Agent' }, NOW)
     s = startBg(s, { id: 'still', toolUseId: '', kind: 'shell', label: 'Still' }, NOW)
-    const out = applyHist(s, h)
+    const out = applyHist(s, h, NOW)
     expect(out.bg.find(b => b.id === 'bsh1')).toMatchObject({ started_at: Date.parse('2026-10-28T07:37:00.100Z'), ended_at: Date.parse('2026-10-28T07:41:50.500Z'), ok: true, end: 'completed', seen: 'completed' })
     expect(out.bg.find(b => b.id === 'still')).toMatchObject({ started_at: NOW, ended_at: null })
     expect(out.title).toBe('GQ3B form "losing" areas')
@@ -668,7 +668,7 @@ describe('0.5.0: what the transcript says', () => {
     expect(later.bg[0]?.started_at).toBe(Date.parse('2026-10-28T07:00:00.000Z'))
   })
   test('/builds-tasks shows the matched end', () => {
-    const s = applyHist(startBg(base(), { id: 'bsh1', toolUseId: '', kind: 'shell', label: 'Sample' }, NOW), parseHist(grep))
+    const s = applyHist(startBg(base(), { id: 'bsh1', toolUseId: '', kind: 'shell', label: 'Sample' }, NOW), parseHist(grep), NOW)
     expect(bgReport(s, [], NOW)).toMatch(/ended \d\d:\d\d \(completed\) · last notice: bsh1 completed/)
   })
   test('the status file keeps the new fields', () => {
