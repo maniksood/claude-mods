@@ -269,6 +269,7 @@ export const barText = (percent: number | null, cells = 10): string => {
 }
 
 export const SESSION_CLOSED = 'session closed'
+export const TURN_ENDED = 'turn ended'
 
 const WORKTREE = /\/mw-([A-Za-z0-9]+)-[^/]+$/
 
@@ -341,7 +342,10 @@ export const progressOf = (s: Status, now: number): Progress => {
   return { pct, left: null, isFromEstimate: false, elapsed }
 }
 
-export const pctText = (p: Progress): string => (p.pct === null ? '' : `${p.pct}%`)
+export const NOT_REPORTED = '% not reported'
+
+/** The % alone; with no checklist it is empty, or says so only when nothing else (time left) is known either. */
+export const pctText = (p: Progress): string => (p.pct !== null ? `${p.pct}%` : p.left === null ? NOT_REPORTED : '')
 
 export const leftText = (p: Progress): string =>
   p.left === null ? 'time left not known yet' : `about ${fmtMin(p.left)} left${p.isFromEstimate ? ' (from the estimate)' : ''}`
@@ -400,8 +404,9 @@ export const bandLine = (s: Status, now: number): string => {
   const end = endLine(s, p, now)
   const bar = p.pct === null ? '' : `${p.pct}% ${barText(p.pct)}`
   if (end) return s.finished ? end : [end, bar].filter(Boolean).join(' · ')
-  const head = p.pct === null ? `${EMOJI[stateOf(s, now)]} no plan yet · ${runningText(p)}` : `${EMOJI[stateOf(s, now)]} ${bar}`
-  return [head, leftText(p), ...workParts(s, true)].join(' · ')
+  const emoji = EMOJI[stateOf(s, now)]
+  if (p.pct === null) return [emoji, ...(p.left === null ? [NOT_REPORTED, leftText(p)] : [leftText(p)]), runningText(p), ...workParts(s, true)].join(' · ').replace(`${emoji} · `, `${emoji} `)
+  return [`${emoji} ${bar}`, leftText(p), ...workParts(s, true)].join(' · ')
 }
 
 /** The lines of a card as plain data (the pane and /builds). */

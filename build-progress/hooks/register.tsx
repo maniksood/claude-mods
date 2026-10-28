@@ -4,9 +4,11 @@ import type { EngineInterface, Register } from 'claude-code'
 import type { Status } from '../types'
 import { avatarSvg } from './art'
 import {
+  ALL_DONE,
   DELETE_MS,
   HEARTBEAT_MS,
   SESSION_CLOSED,
+  TURN_ENDED,
   applyParsed,
   applyTool,
   bandLine,
@@ -137,6 +139,13 @@ export const register: Register = (on, options) => {
     } catch {
       // no history to read: the title stays the folder
     }
+    try {
+      // a reload starts from a blank status; the first prompt's time is kept from this session's own earlier file
+      const old = normalize(JSON.parse(await $.fs.read(`${dir}/${sid}.json`)))
+      if (old && old.session === sid && old.started_at < status.started_at) status = { ...status, started_at: old.started_at }
+    } catch {
+      // no earlier file
+    }
     await writeNow($)
     await $.command.register({ name: 'builds', description: 'List every Claude Code session and its progress' })
     void $.ui.open({ id: PANE, title: 'Builds' })
@@ -177,14 +186,14 @@ export const register: Register = (on, options) => {
       const expect = expectFrom(e.text)
       await change($, s => ({ ...s, started_at: now, prompt_id: id, role: role ?? s.role, expect_h: expect }))
     } else {
-      await change($, s => ({ ...s, finished: s.finished?.verdict === SESSION_CLOSED ? null : s.finished }))
+      await change($, s => ({ ...s, finished: s.finished?.verdict === ALL_DONE ? s.finished : null }))
     }
 
     return next(e)
   })
 
   on('turn.start', async ($, e, next) => {
-    if (!e.agentId) await change($, s => ({ ...s, finished: s.finished?.verdict === SESSION_CLOSED ? null : s.finished }))
+    if (!e.agentId) await change($, s => ({ ...s, finished: s.finished?.verdict === ALL_DONE ? s.finished : null }))
 
     return next(e)
   })
@@ -253,7 +262,7 @@ export const register: Register = (on, options) => {
         ...s,
         tool_now: null,
         tool_since: null,
-        finished: failed && !s.finished ? { at: s.updated_at, verdict: scrub(`ended: ${e.reason}`, 60), ok: false } : s.finished,
+        finished: s.finished ?? (failed ? { at: s.updated_at, verdict: scrub(`ended: ${e.reason}`, 60), ok: false } : e.reason === 'answer' && s.subagents.length === 0 ? { at: s.updated_at, verdict: TURN_ENDED, ok: true } : null),
       }))
     }
 
@@ -290,7 +299,7 @@ export const register: Register = (on, options) => {
           {Svg ? <Svg source={avatarSvg(c.state, colorFor(me.prompt_id === '—' ? me.folder : me.prompt_id))} alt={c.state} width={32} height={30} isInteractive /> : <Text>{c.emoji}</Text>}
           <Text bold>{c.title}</Text>
         </Box>
-        <Text bold>{c.pct || 'no plan yet'}</Text>
+        {c.pct !== '' && <Text bold>{c.pct}</Text>}
         <Text>{c.bar}</Text>
         <Text>{c.end ?? c.left}</Text>
         <Text dimColor>{c.running}</Text>
