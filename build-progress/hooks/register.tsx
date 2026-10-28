@@ -105,7 +105,7 @@ const findTasksDir = async ($: Eng): Promise<string | null> => {
   for (const root of ['/private/tmp', '/tmp']) {
     try {
       for (const f of await $.fs.list(root)) {
-        if (f.kind !== 'directory' || !f.name.startsWith('claude-')) continue
+        if (f.kind !== 'dir' || !f.name.startsWith('claude-')) continue
         const dir = `${root}/${f.name}/${slug}/${sessionId}/tasks`
         if (await $.fs.exists(dir)) return (tasksDir = dir)
       }

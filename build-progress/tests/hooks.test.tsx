@@ -30,7 +30,7 @@ const rig = (on: On, sid = 's1'): Rig => {
     return { value: undefined }
   })
   on('fs.list', (_, e) => ({
-    value: e.path === '/private/tmp' ? [{ name: 'claude-501', kind: 'directory' as const, size: 0, mtimeMs: 0, isLink: false }] : [...files.entries()]
+    value: e.path === '/private/tmp' ? [{ name: 'claude-501', kind: 'dir' as const, size: 0, mtimeMs: 0, isLink: false }] : [...files.entries()]
       .filter(([p]) => p.startsWith(DIR))
       .map(([p, t]) => ({ name: p.slice(DIR.length + 1), kind: 'file' as const, size: t.length, mtimeMs: clock.now(), isLink: false })),
   }))
