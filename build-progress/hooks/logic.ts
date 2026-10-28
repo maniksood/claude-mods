@@ -3,6 +3,8 @@ import type { Bg, Finish, Marker, Report, Status, Step, Task } from '../types'
 export const QUIET_MS = 10 * 60_000
 export const STALE_TOOL_MS = 15 * 60_000
 export const HEARTBEAT_MS = 60_000
+/** How often a working session reads its own transcript again for task ends its live hook missed. */
+export const RESCAN_MS = 2 * 60_000
 export const HIDE_MS = 12 * 3_600_000
 export const DELETE_MS = 2 * 24 * 3_600_000
 export const ALL_DONE = 'all items done'
@@ -829,6 +831,7 @@ export const visibleRuns = (list: Status[], now: number, showFinished: boolean):
  * What the session's transcript says about its background tasks, its turns and its name: ids, status words, clock times. No text.
  * `limits`: when a monitor reaches its own time limit (its start plus `timeoutMs`); its last notice carries no status word.
  * `first`: the earliest row time, the session's start. `turn_end`: the newest `turn_duration` row, the last turn's end.
+ * `list_at`: the newest call of a to-do list tool, when an all-done list was finished.
  */
 export type Hist = {
   title: string
@@ -837,24 +840,25 @@ export type Hist = {
   limits: Record<string, number>
   first: number | null
   turn_end: number | null
+  list_at: number | null
 }
 
-/** The pattern `grep -noE` runs over the transcript: row times, background starts and ends (a TaskStop's result row too), monitors' time limits, turn ends, the session's name. */
-export const HIST_PATTERN = '"timestamp":"[^"]+"|"backgroundTaskId":"[A-Za-z0-9]+"|"status":"async_launched","agentId":"[A-Za-z0-9]+"|"taskId":"[A-Za-z0-9]+","timeoutMs":[0-9]+,"persistent":(true|false)|"task_id":"[A-Za-z0-9]+","task_type":"[a-z_]+"|<task-id>[^<]+</task-id>|<status>[^<]+</status>|"subtype":"turn_duration"|"customTitle":"[^"]*"'
+/** The pattern `grep -noE` runs over the transcript: row times, background starts and ends (a TaskStop's result row too), monitors' time limits, turn ends, to-do list calls (the tool's name only), the session's name. */
+export const HIST_PATTERN = '"timestamp":"[^"]+"|"name":"(TodoWrite|TaskCreate|TaskUpdate|([A-Za-z0-9_-]+__)?update_plan)"|"backgroundTaskId":"[A-Za-z0-9]+"|"status":"async_launched","agentId":"[A-Za-z0-9]+"|"taskId":"[A-Za-z0-9]+","timeoutMs":[0-9]+,"persistent":(true|false)|"task_id":"[A-Za-z0-9]+","task_type":"[a-z_]+"|<task-id>[^<]+</task-id>|<status>[^<]+</status>|"subtype":"turn_duration"|"customTitle":"[^"]*"'
 
 /** The end word of a monitor that ran to its own time limit. */
 export const TIMED_OUT = 'timed out'
 
 /** Reads `grep -noE` output (`line:match`): a start is a row with a `backgroundTaskId`, an `async_launched` agent or a monitor's `taskId`; an end is a row with a `<task-id>` and a terminal `<status>`, or a TaskStop's result (`killed`); the first row time of each wins. */
 export const parseHist = (stdout: string): Hist => {
-  const out: Hist = { title: '', starts: {}, ends: {}, limits: {}, first: null, turn_end: null }
-  const rows = new Map<string, { ts: number | null; starts: string[]; monitors: { id: string; ms: number; isPersistent: boolean }[]; stops: string[]; ids: string[]; statuses: string[]; isTurnEnd: boolean }>()
+  const out: Hist = { title: '', starts: {}, ends: {}, limits: {}, first: null, turn_end: null, list_at: null }
+  const rows = new Map<string, { ts: number | null; starts: string[]; monitors: { id: string; ms: number; isPersistent: boolean }[]; stops: string[]; ids: string[]; statuses: string[]; isTurnEnd: boolean; isList: boolean }>()
   for (const raw of stdout.split('\n')) {
     const i = raw.indexOf(':')
     if (i < 0) continue
     const key = raw.slice(0, i)
     const m = raw.slice(i + 1)
-    const row = rows.get(key) ?? { ts: null, starts: [], monitors: [], stops: [], ids: [], statuses: [], isTurnEnd: false }
+    const row = rows.get(key) ?? { ts: null, starts: [], monitors: [], stops: [], ids: [], statuses: [], isTurnEnd: false, isList: false }
     rows.set(key, row)
     const ts = /^"timestamp":"([^"]+)"$/.exec(m)?.[1]
     const shell = /^"backgroundTaskId":"([A-Za-z0-9]+)"$/.exec(m)?.[1]
@@ -871,6 +875,7 @@ export const parseHist = (stdout: string): Hist => {
     else if (monitor) row.monitors.push({ id: monitor[1] as string, ms: Number(monitor[2]), isPersistent: monitor[3] === 'true' })
     else if (stop) row.stops.push(stop)
     else if (m === '"subtype":"turn_duration"') row.isTurnEnd = true
+    else if (m.startsWith('"name":"')) row.isList = true
     else if (id) row.ids.push(id.trim())
     else if (status) row.statuses.push(status.trim().toLowerCase())
     else if (title !== undefined) {
@@ -885,6 +890,7 @@ export const parseHist = (stdout: string): Hist => {
     if (row.ts === null) continue
     out.first = Math.min(out.first ?? Infinity, row.ts)
     if (row.isTurnEnd) out.turn_end = Math.max(out.turn_end ?? -Infinity, row.ts)
+    if (row.isList) out.list_at = Math.max(out.list_at ?? -Infinity, row.ts)
     for (const id of row.starts) out.starts[id] = Math.min(out.starts[id] ?? Infinity, row.ts)
     for (const mon of row.monitors) {
       out.starts[mon.id] = Math.min(out.starts[mon.id] ?? Infinity, row.ts)
@@ -902,25 +908,32 @@ export const parseHist = (stdout: string): Hist => {
 }
 
 /** The transcript's facts laid on the task list: the session's start when no prompt gave it, each task's own start, and its end when the transcript has it (a monitor past its time limit ended there). */
-export const applyHist = (s: Status, h: Hist, now: number): Status => ({
-  ...s,
-  title: h.title || s.title,
-  ...(!s.start_known && h.first !== null ? { started_at: h.first, start_known: true } : {}),
-  bg: s.bg.map(b => {
-    const start = h.starts[b.id] ?? h.starts[b.tool_use_id]
-    const o = start === undefined ? b : { ...b, started_at: start }
-    const limit = h.limits[b.id] ?? h.limits[b.tool_use_id]
-    const end = h.ends[b.id] ?? h.ends[b.tool_use_id] ?? (limit !== undefined && limit <= now ? { at: limit, status: TIMED_OUT } : undefined)
-    if (!end) return o
-    // an end the replay gave has no time of its own (it was stamped at the reload): the file's earlier time replaces it
-    if (o.ended_at !== null) return end.at < o.ended_at ? { ...o, ended_at: end.at } : o
-    const word = scrub(end.status, 20).toLowerCase()
-    // a time limit is no notice: the last notice seen stays as it was
-    if (word === TIMED_OUT) return { ...o, ended_at: end.at, ok: true, end: word }
+export const applyHist = (s: Status, h: Hist, now: number): Status => {
+  const out: Status = {
+    ...s,
+    title: h.title || s.title,
+    ...(!s.start_known && h.first !== null ? { started_at: h.first, start_known: true } : {}),
+    bg: s.bg.map(b => {
+      const start = h.starts[b.id] ?? h.starts[b.tool_use_id]
+      const o = start === undefined ? b : { ...b, started_at: start }
+      const limit = h.limits[b.id] ?? h.limits[b.tool_use_id]
+      const end = h.ends[b.id] ?? h.ends[b.tool_use_id] ?? (limit !== undefined && limit <= now ? { at: limit, status: TIMED_OUT } : undefined)
+      if (!end) return o
+      // an end the replay gave has no time of its own (it was stamped at the reload): the file's earlier time replaces it
+      if (o.ended_at !== null) return end.at < o.ended_at ? { ...o, ended_at: end.at } : o
+      const word = scrub(end.status, 20).toLowerCase()
+      // a time limit is no notice: the last notice seen stays as it was
+      if (word === TIMED_OUT) return { ...o, ended_at: end.at, ok: true, end: word }
+  
+      return { ...o, ended_at: end.at, ok: word === 'completed' || word === 'done' || word === 'finished', end: word, seen: word }
+    }),
+  }
+  // the last task ends after the turn (a notice the live hook missed): the finish moves to that end, as a live notice would move it
+  const late = out.bg.flatMap(b => (b.ended_at !== null && s.bg.find(x => x.id === b.id)?.ended_at === null ? [b.ended_at] : []))
+  if (late.length === 0 || !out.finished?.ok || bgRunning(out, now).length > 0) return out
 
-    return { ...o, ended_at: end.at, ok: word === 'completed' || word === 'done' || word === 'finished', end: word, seen: word }
-  }),
-})
+  return { ...out, finished: { ...out.finished, at: Math.max(out.finished.at, ...late) } }
+}
 
 /** Reads this session's earlier rows once: the first prompt's id, role and EXPECT, the to-do list, the markers. */
 export type Row = { role: string; text?: string; toolUses?: { tool?: string; tool_use_id?: string; input?: unknown; result?: unknown; text?: unknown }[] }
@@ -973,6 +986,8 @@ export const recoverAll = (s: Status, rows: readonly Row[], now: number, hist: H
   out = hist ? applyHist(out, hist, now) : out
   const from = (b: Bg): Found['from'] => (!byReplay.has(b.id) ? 'file' : byReplay.get(b.id) === b.ended_at ? 'replay' : 'both')
   const ended: Found[] = out.bg.flatMap(b => (b.ended_at === null ? [] : [{ ...b, from: from(b) }]))
+  // the list was done before the reload: its finish is the last list call's time (or a later task end), not the reload
+  if (out.finished?.verdict === ALL_DONE && hist?.list_at != null) out = { ...out, finished: { ...out.finished, at: Math.max(hist.list_at, ...ended.map(b => b.ended_at as number)) } }
   // what ended before the reload is not known to the minute without the file: only the running ones are rebuilt (the status file's own earlier copy adds the recent ones)
   out = { ...out, bg: out.bg.filter(b => b.ended_at === null || (hist !== null && now - b.ended_at <= BG_DONE_MS)) }
   const lastRow = [...rows].reverse().find(r => !isCommandEcho(r))

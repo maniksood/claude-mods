@@ -9,6 +9,7 @@ import {
   DELETE_MS,
   HEARTBEAT_MS,
   HIST_PATTERN,
+  RESCAN_MS,
   SESSION_CLOSED,
   STOPPED_BY_YOU,
   TURN_ENDED,
@@ -62,6 +63,8 @@ const CLOCK_MS = 30_000
 const TASK_TOOLS = ['TodoWrite', 'TaskCreate', 'TaskUpdate']
 
 const isBusy = (s: Status, now: number): boolean => s.tool_now !== null || s.subagents.length > 0 || bgRunning(s, now).length > 0
+/** A turn is open, or a background task still counts as running: the transcript may hold an end not seen live. */
+const isWorking = (s: Status, now: number): boolean => s.finished === null || bgRunning(s, now).length > 0
 
 type Eng = EngineInterface
 
@@ -84,8 +87,8 @@ let cwdNow = ''
 let homeDir = ''
 let configDir = ''
 let tasksDir: string | null = null
-let isReconciling = false
-let beats = 0
+let isRescanning = false
+let isScanning = false
 
 /** Where the transcript may be: under the app's own folder (`CLAUDE_CONFIG_DIR`, else `~/.claude`), in the folder named for the working directory with every character outside letters, digits and `-` turned into `-`. */
 const transcriptPaths = (): string[] =>
@@ -148,17 +151,27 @@ const scanOutputs = async ($: Eng): Promise<void> => {
   }
 }
 
-/** What the transcript says (ends the live notices missed, each task's own start, the name) and what the tasks' outputs say. */
-const reconcile = async ($: Eng): Promise<void> => {
-  if (isReconciling || !status) return
-  isReconciling = true
+/** What the transcript says: ends the live notices missed (another plugin may pass `session.append` on past this one), each task's own start, the name. */
+const rescan = async ($: Eng): Promise<void> => {
+  if (isRescanning || !status) return
+  isRescanning = true
   try {
     const hist = await loadHist($)
     const now = await $.clock.now()
     if (hist) await change($, s => applyHist(s, hist, now), false)
+  } finally {
+    isRescanning = false
+  }
+}
+
+/** What the running tasks' outputs say: their %. */
+const scanOnce = async ($: Eng): Promise<void> => {
+  if (isScanning) return
+  isScanning = true
+  try {
     await scanOutputs($)
   } finally {
-    isReconciling = false
+    isScanning = false
   }
 }
 
@@ -303,12 +316,18 @@ export const register: Register = (on, options) => {
     void $.ui.open({ id: PANE, title: 'Builds' })
     void update($, nowAtom, () => now)
     $.clock.every(CLOCK_MS, () => void $.clock.now().then(t => update($, nowAtom, () => t)))
-    // a long tool call or helper writes nothing on its own: the heartbeat says the run is alive
+    // a long tool call or helper writes nothing on its own: the heartbeat says the run is alive, and reads the running tasks' %
     $.clock.every(HEARTBEAT_MS, () => {
-      if (status) void $.clock.now().then(t => status && isBusy(status, t) && change($, s => s, true))
-      // the transcript is the safety net for a notice the live hook missed; quiet sessions look every fifth beat
-      beats += 1
-      if (status) void $.clock.now().then(t => status && (bgRunning(status, t).length > 0 || beats % 5 === 0) && reconcile($))
+      void $.clock.now().then(t => {
+        if (status && isBusy(status, t)) void change($, s => s, true)
+        if (status && bgRunning(status, t).length > 0) void scanOnce($)
+      })
+    })
+    // the transcript is the safety net for a notice the live hook missed: read again every 2 minutes while the session works
+    $.clock.every(RESCAN_MS, () => {
+      void $.clock.now().then(t => {
+        if (status && isWorking(status, t)) void rescan($)
+      })
     })
 
     return next(e)

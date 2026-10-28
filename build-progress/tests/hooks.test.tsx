@@ -673,7 +673,7 @@ test('a reload: the transcript gives each task its own start, the end the live h
   await ui.unmount()
 })
 
-test('the safety net: a task whose notice was missed is ended by the transcript within a minute', async ($, on) => {
+test('the safety net: a task whose notice was missed is ended by the transcript within 2 minutes', async ($, on) => {
   const r = rig(on)
   const path = `${HOME}/.claude/projects/-Users-tester-Work-claude-mods/s1.jsonl`
   let grep = ''
@@ -685,6 +685,9 @@ test('the safety net: a task whose notice was missed is ended by the transcript 
   await $.tool.call({ tool: 'Bash', tool_use_id: 'tu1', command: 'x', description: 'Sample', run_in_background: true } as never)
   grep = ['5:"timestamp":"2026-10-28T07:41:50.500Z"', '5:<task-id>bsh1</task-id>', '5:<status>completed</status>'].join('\n')
   await r.clock.advance(61_000)
+  await r.clock.advance(3000)
+  expect(mine(r).bg[0]).toMatchObject({ id: 'bsh1', end: null })
+  await r.clock.advance(60_000)
   await r.clock.advance(3000)
   expect(mine(r).bg[0]).toMatchObject({ id: 'bsh1', end: 'completed' })
 })
@@ -753,6 +756,18 @@ const envelope = (id: string, status: string | null) =>
   status === null
     ? `<task-notification>\n<task-id>${id}</task-id>\n<summary>…</summary>\n<event>…</event>\n</task-notification>`
     : `<task-notification>\n<task-id>${id}</task-id>\n<tool-use-id>toolu_${id}</tool-use-id>\n<output-file>…</output-file>\n<status>${status}</status>\n<summary>…</summary>\n</task-notification>`
+/** The three rows of a task's end notice: queued, delivered as an attachment, taken off the queue; each row's `timestamp` is left for the caller. */
+const endRows = (id: string, ts: string): object[] => {
+  const body = envelope(id, 'completed')
+
+  return [
+    { type: 'queue-operation', operation: 'enqueue', timestamp: '', sessionId: 's1', content: body },
+    { parentUuid: 'u', isSidechain: false, attachment: { type: 'queued_command', prompt: body, source_uuid: 'u', delivery_id: 'd', commandMode: 'task-notification', origin: { kind: 'task-notification', producer: '…' }, timestamp: ts }, type: 'attachment', uuid: 'u', timestamp: '', rendered: [{ content: `<system-reminder>${body}</system-reminder>` }], renderedRole: 'system', ...BASE },
+    { type: 'queue-operation', operation: 'remove', timestamp: '', sessionId: 's1', content: body, reason: '…', commandUuid: 'u', deliveryId: 'd' },
+  ]
+}
+/** A row as the file holds it, at the test clock's time `t`. */
+const rowAt = (o: object, t: number): string => JSON.stringify(o).replace('"timestamp":""', `"timestamp":"${new Date(t).toISOString()}"`)
 /** The transcript file: a launch row per task, the three rows of each end notice, a monitor's last event, the turn's end, two slash commands. */
 const transcript = (T: number, jobs: Job[], turnEnd: string): string[] => {
   const rows: Array<[string, object]> = [['06:05:27.235', { parentUuid: null, isSidechain: false, promptId: 'p', type: 'user', message: { role: 'user', content: '…' }, uuid: 'u', timestamp: '', ...BASE }]]
@@ -760,10 +775,7 @@ const transcript = (T: number, jobs: Job[], turnEnd: string): string[] => {
     rows.push([j.start, { parentUuid: 'u', isSidechain: false, promptId: 'p', type: 'user', message: { role: 'user', content: [{ tool_use_id: `toolu_${j.id}`, type: 'tool_result', content: '…' }] }, uuid: 'u', timestamp: '', toolUseResult: toolUseResult(j), sourceToolAssistantUUID: 'u', ...BASE }])
     const end = j.end
     if (end) {
-      const body = envelope(j.id, 'completed')
-      rows.push([end, { type: 'queue-operation', operation: 'enqueue', timestamp: '', sessionId: 's1', content: body }])
-      rows.push([end, { parentUuid: 'u', isSidechain: false, attachment: { type: 'queued_command', prompt: body, source_uuid: 'u', delivery_id: 'd', commandMode: 'task-notification', origin: { kind: 'task-notification', producer: '…' }, timestamp: at(T, end) }, type: 'attachment', uuid: 'u', timestamp: '', rendered: [{ content: `<system-reminder>${body}</system-reminder>` }], renderedRole: 'system', ...BASE }])
-      rows.push([end, { type: 'queue-operation', operation: 'remove', timestamp: '', sessionId: 's1', content: body, reason: '…', commandUuid: 'u', deliveryId: 'd' }])
+      for (const o of endRows(j.id, at(T, end))) rows.push([end, o])
     } else if (j.kind === 'monitor') {
       // a monitor's notices are events with no status word; the last one comes at its time limit
       rows.push([j.start, { parentUuid: 'u', isSidechain: false, promptId: 'p', type: 'user', message: { role: 'user', content: envelope(j.id, null) }, uuid: 'u', timestamp: '', origin: { kind: 'task-notification', producer: '…' }, ...BASE }])
@@ -885,4 +897,61 @@ test('MOD-9: an end the replay carries takes its time from the transcript file; 
   expect(out).toContain(`id bmb4mdg4d · started ${hhmm('06:57:17.552')} · ended ${hhmm('06:59:21.850')} (killed)`)
   expect(out).toContain(`id b2khaqeqq · started ${hhmm('07:08:46.367')} · ended ${hhmm('07:25:53.101')} (killed)`)
   expect(out).toContain('3 task ends in them; the transcript file gave 0 more and the time of 3 of those')
+})
+
+test('MOD-9.2: while the session works its transcript is read again every 2 minutes, so an end the live hook never got ends the task at its own time', async ($, on) => {
+  const r = rig(on)
+  const path = `${HOME}/.claude/projects/-Users-tester-Work-claude-mods/s1.jsonl`
+  const lines: string[] = []
+  let greps = 0
+  on('fs.exists', (_, e) => ({ value: e.path === path }))
+  on('process.run', (_, e) => {
+    if (e.argv[0] === 'grep') greps += 1
+
+    return { value: { exitCode: e.argv[0] === 'grep' && e.argv[3] === path ? 0 : 1, stdout: e.argv[0] === 'grep' && e.argv[3] === path ? grepOf(lines) : '', stderr: '' } as never }
+  })
+  r.results.Bash = toolUseResult({ id: 'b9iyoipb2', kind: 'shell', start: '', end: null })
+  await $.session.start(START)
+  await $.prompt.submit({ text: '# FNR3B …' } as never)
+  await $.tool.call({ tool: 'Bash', tool_use_id: 'toolu_b9iyoipb2', command: '…', description: 'Task b9iyoipb2', run_in_background: true } as never)
+  await $.turn.complete({ turnId: 'x', reason: 'answer', text: '…', answer: '…' } as never)
+  await r.clock.advance(3000)
+  expect(await bandText($)).toContain('⏳ Waiting on 1 background task')
+  // the task ends; its notice reaches the file, but no session.append reaches the mod (another plugin passed it on past this one)
+  const endedAt = r.clock.now() + 10_000
+  await r.clock.advance(20_000)
+  for (const o of endRows('b9iyoipb2', new Date(endedAt).toISOString())) lines.push(rowAt(o, endedAt))
+  const before = greps
+  await r.clock.advance(2 * 60_000)
+  await r.clock.advance(3000)
+  expect(greps - before).toBe(1)
+  expect(mine(r).bg[0]).toMatchObject({ id: 'b9iyoipb2', ended_at: endedAt, end: 'completed', ok: true })
+  // the finish moves to the task's own end, not to the moment the file was read
+  expect(mine(r).finished).toMatchObject({ at: endedAt, ok: true })
+  expect(await bandText($)).toContain('✅ Finished')
+  expect(await bandText($)).not.toContain('in background')
+  // finished with nothing running: no more reads
+  const after = greps
+  await r.clock.advance(10 * 60_000)
+  expect(greps).toBe(after)
+})
+
+test('MOD-9.2: a session whose whole list was done reloads as Finished at its last list call, not at the reload', async ($, on) => {
+  const r = rig(on)
+  const T = r.clock.now()
+  const path = `${HOME}/.claude/projects/-Users-tester-Work-claude-mods/s1.jsonl`
+  const list = { todos: [{ content: '…', status: 'completed', activeForm: '…' }, { content: '…', status: 'completed', activeForm: '…' }] }
+  const call = (hms: string) => rowAt({ parentUuid: 'u', isSidechain: false, message: { model: '…', id: 'm', type: 'message', role: 'assistant', content: [{ type: 'tool_use', id: 'toolu_list', name: 'TodoWrite', input: list, caller: { type: 'direct' } }], stop_reason: 'tool_use' }, type: 'assistant', uuid: 'u', timestamp: '', ...BASE }, Date.parse(at(T, hms)))
+  const lines = [call('06:30:00.000'), call('07:41:12.000'), ...transcript(T, [], '08:13:36.924')]
+  reloadWith(on, r, path, lines, [])
+  r.history = [
+    { role: 'user', text: '# FNR3B …' },
+    { role: 'assistant', text: '', toolUses: [{ tool: 'TodoWrite', tool_use_id: 'toolu_list', input: list, result: {}, text: '…' }] },
+    { role: 'user', text: '', toolResults: [{ tool_use_id: 'toolu_list', text: '…', isError: false }] },
+    { role: 'assistant', text: '…', toolUses: [] },
+  ]
+  await $.session.start(START)
+  await r.clock.advance(5000)
+  expect(mine(r).finished).toMatchObject({ at: Date.parse(at(T, '07:41:12.000')), verdict: 'all items done', ok: true })
+  expect(await bandText($)).toContain('took 1 h 36 min')
 })
