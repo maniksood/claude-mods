@@ -835,27 +835,28 @@ export type Hist = {
   turn_end: number | null
 }
 
-/** The pattern `grep -noE` runs over the transcript: row times, background starts and ends, monitors' time limits, turn ends, the session's name. */
-export const HIST_PATTERN = '"timestamp":"[^"]+"|"backgroundTaskId":"[A-Za-z0-9]+"|"status":"async_launched","agentId":"[A-Za-z0-9]+"|"taskId":"[A-Za-z0-9]+","timeoutMs":[0-9]+,"persistent":(true|false)|<task-id>[^<]+</task-id>|<status>[^<]+</status>|"subtype":"turn_duration"|"customTitle":"[^"]*"'
+/** The pattern `grep -noE` runs over the transcript: row times, background starts and ends (a TaskStop's result row too), monitors' time limits, turn ends, the session's name. */
+export const HIST_PATTERN = '"timestamp":"[^"]+"|"backgroundTaskId":"[A-Za-z0-9]+"|"status":"async_launched","agentId":"[A-Za-z0-9]+"|"taskId":"[A-Za-z0-9]+","timeoutMs":[0-9]+,"persistent":(true|false)|"task_id":"[A-Za-z0-9]+","task_type":"[a-z_]+"|<task-id>[^<]+</task-id>|<status>[^<]+</status>|"subtype":"turn_duration"|"customTitle":"[^"]*"'
 
 /** The end word of a monitor that ran to its own time limit. */
 export const TIMED_OUT = 'timed out'
 
-/** Reads `grep -noE` output (`line:match`): a start is a row with a `backgroundTaskId`, an `async_launched` agent or a monitor's `taskId`; an end is a row with a `<task-id>` and a terminal `<status>`; the first row time of each wins. */
+/** Reads `grep -noE` output (`line:match`): a start is a row with a `backgroundTaskId`, an `async_launched` agent or a monitor's `taskId`; an end is a row with a `<task-id>` and a terminal `<status>`, or a TaskStop's result (`killed`); the first row time of each wins. */
 export const parseHist = (stdout: string): Hist => {
   const out: Hist = { title: '', starts: {}, ends: {}, limits: {}, first: null, turn_end: null }
-  const rows = new Map<string, { ts: number | null; starts: string[]; monitors: { id: string; ms: number; isPersistent: boolean }[]; ids: string[]; statuses: string[]; isTurnEnd: boolean }>()
+  const rows = new Map<string, { ts: number | null; starts: string[]; monitors: { id: string; ms: number; isPersistent: boolean }[]; stops: string[]; ids: string[]; statuses: string[]; isTurnEnd: boolean }>()
   for (const raw of stdout.split('\n')) {
     const i = raw.indexOf(':')
     if (i < 0) continue
     const key = raw.slice(0, i)
     const m = raw.slice(i + 1)
-    const row = rows.get(key) ?? { ts: null, starts: [], monitors: [], ids: [], statuses: [], isTurnEnd: false }
+    const row = rows.get(key) ?? { ts: null, starts: [], monitors: [], stops: [], ids: [], statuses: [], isTurnEnd: false }
     rows.set(key, row)
     const ts = /^"timestamp":"([^"]+)"$/.exec(m)?.[1]
     const shell = /^"backgroundTaskId":"([A-Za-z0-9]+)"$/.exec(m)?.[1]
     const agent = /^"status":"async_launched","agentId":"([A-Za-z0-9]+)"$/.exec(m)?.[1]
     const monitor = /^"taskId":"([A-Za-z0-9]+)","timeoutMs":(\d+),"persistent":(true|false)$/.exec(m)
+    const stop = /^"task_id":"([A-Za-z0-9]+)","task_type":"[a-z_]+"$/.exec(m)?.[1]
     const id = /^<task-id>([^<]+)<\/task-id>$/.exec(m)?.[1]
     const status = /^<status>([^<]+)<\/status>$/.exec(m)?.[1]
     const title = /^"customTitle":"(.*)"$/.exec(m)?.[1]
@@ -864,6 +865,7 @@ export const parseHist = (stdout: string): Hist => {
       row.ts = Number.isFinite(t) ? t : null
     } else if (shell || agent) row.starts.push((shell ?? agent) as string)
     else if (monitor) row.monitors.push({ id: monitor[1] as string, ms: Number(monitor[2]), isPersistent: monitor[3] === 'true' })
+    else if (stop) row.stops.push(stop)
     else if (m === '"subtype":"turn_duration"') row.isTurnEnd = true
     else if (id) row.ids.push(id.trim())
     else if (status) row.statuses.push(status.trim().toLowerCase())
@@ -886,9 +888,10 @@ export const parseHist = (stdout: string): Hist => {
     }
     const id = row.ids[0]
     const status = row.statuses[0]
-    if (id && status && TERMINAL.test(status)) {
-      const was = out.ends[id]
-      if (!was || row.ts < was.at) out.ends[id] = { at: row.ts, status }
+    const ends = [...row.stops.map(x => [x, 'killed']), ...(id && status && TERMINAL.test(status) ? [[id, status]] : [])]
+    for (const [x, word] of ends as [string, string][]) {
+      const was = out.ends[x]
+      if (!was || row.ts < was.at) out.ends[x] = { at: row.ts, status: word }
     }
   }
   return out
@@ -904,7 +907,9 @@ export const applyHist = (s: Status, h: Hist, now: number): Status => ({
     const o = start === undefined ? b : { ...b, started_at: start }
     const limit = h.limits[b.id] ?? h.limits[b.tool_use_id]
     const end = h.ends[b.id] ?? h.ends[b.tool_use_id] ?? (limit !== undefined && limit <= now ? { at: limit, status: TIMED_OUT } : undefined)
-    if (!end || o.ended_at !== null) return o
+    if (!end) return o
+    // an end the replay gave has no time of its own (it was stamped at the reload): the file's earlier time replaces it
+    if (o.ended_at !== null) return end.at < o.ended_at ? { ...o, ended_at: end.at } : o
     const word = scrub(end.status, 20).toLowerCase()
     // a time limit is no notice: the last notice seen stays as it was
     if (word === TIMED_OUT) return { ...o, ended_at: end.at, ok: true, end: word }
@@ -916,8 +921,8 @@ export const applyHist = (s: Status, h: Hist, now: number): Status => ({
 /** Reads this session's earlier rows once: the first prompt's id, role and EXPECT, the to-do list, the markers. */
 export type Row = { role: string; text?: string; toolUses?: { tool?: string; tool_use_id?: string; input?: unknown; result?: unknown; text?: unknown }[] }
 
-/** A background task that ended before a reload, and where its end was read: a notice in the replayed history, or the transcript file. */
-export type Found = Bg & { from: 'replay' | 'file' }
+/** A background task that ended before a reload, and where its end was read: a notice in the replayed history (its time from the transcript file: `both`), or the transcript file. */
+export type Found = Bg & { from: 'replay' | 'both' | 'file' }
 
 /** A slash command's echo in the history (`/reload-plugins`, `/builds-tasks`): not work, and no sign the turn is still open. */
 const isCommandEcho = (r: Row): boolean => r.role === 'user' && /^\s*<(command-name|command-message|local-command-[a-z]+)>/.test(r.text ?? '')
@@ -960,9 +965,10 @@ export const recoverAll = (s: Status, rows: readonly Row[], now: number, hist: H
     }
   }
   // the replay carries a notice only when it opened a turn; the transcript file has the rest, and the times
-  const byReplay = new Set(out.bg.filter(b => b.ended_at !== null).map(b => b.id))
+  const byReplay = new Map(out.bg.flatMap(b => (b.ended_at === null ? [] : [[b.id, b.ended_at] as const])))
   out = hist ? applyHist(out, hist, now) : out
-  const ended: Found[] = out.bg.flatMap(b => (b.ended_at === null ? [] : [{ ...b, from: byReplay.has(b.id) ? ('replay' as const) : ('file' as const) }]))
+  const from = (b: Bg): Found['from'] => (!byReplay.has(b.id) ? 'file' : byReplay.get(b.id) === b.ended_at ? 'replay' : 'both')
+  const ended: Found[] = out.bg.flatMap(b => (b.ended_at === null ? [] : [{ ...b, from: from(b) }]))
   // what ended before the reload is not known to the minute without the file: only the running ones are rebuilt (the status file's own earlier copy adds the recent ones)
   out = { ...out, bg: out.bg.filter(b => b.ended_at === null || (hist !== null && now - b.ended_at <= BG_DONE_MS)) }
   const lastRow = [...rows].reverse().find(r => !isCommandEcho(r))
@@ -1069,7 +1075,7 @@ export const bgReport = (s: Status, lost: readonly string[], now: number, found:
   const from = (b: Bg): string => {
     const f = b.ended_at === null ? undefined : found.find(x => x.id === b.id)
 
-    return f ? ` · end read from ${f.from === 'replay' ? 'the replayed history' : 'the transcript file'}` : ''
+    return f ? ` · end read from ${f.from === 'replay' ? 'the replayed history' : f.from === 'both' ? 'the replayed history, its time from the transcript file' : 'the transcript file'}` : ''
   }
   const before = found.filter(f => !s.bg.some(b => b.id === f.id))
   const rows = [...s.bg, ...before].map(b => `${b.ended_at === null ? (now - b.started_at > BG_CAP_MS ? 'no news' : 'running') : 'ended'} · ${b.kind} · ${b.label} · id ${b.id} · started ${fmtClock(b.started_at)}${b.ended_at === null ? '' : ` · ended ${fmtClock(b.ended_at)} (${b.end ?? '?'})`} · last notice: ${b.seen ? `${b.id} ${b.seen}` : 'none'}${from(b)}`)

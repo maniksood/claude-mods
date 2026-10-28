@@ -821,7 +821,7 @@ test('MOD-9: a finished session with 11 ended tasks reloads as Finished, 0 in ba
   expect(out.match(/\(completed\)/g)?.length).toBe(9)
   expect(out.match(/\(timed out\)/g)?.length).toBe(2)
   expect(out).not.toContain('no news')
-  expect(out).toContain('the transcript file gave 11 more')
+  expect(out).toContain('the transcript file gave 11 more and the time of 0 of those')
   expect(out).not.toContain('…')
 })
 
@@ -840,4 +840,45 @@ test('MOD-9: a session with one really running task reloads with 1 in background
   const out = JSON.stringify(await $.command.run({ command: 'builds-tasks', args: '' } as never))
   expect(out).toContain('1 counted as running')
   expect(out).toMatch(/running · shell · Task b1x7rq8pn · id b1x7rq8pn · started \d\d:\d\d · last notice: none/)
+})
+
+test('MOD-9: an end the replay carries takes its time from the transcript file; a TaskStop is read from its result row', async ($, on) => {
+  const r = rig(on)
+  const T = r.clock.now()
+  const path = `${HOME}/.claude/projects/-Users-tester-Work-claude-mods/s1.jsonl`
+  const jobs: Job[] = [
+    { id: 'bgsy2gvie', kind: 'shell', start: '06:52:00.100', end: null },
+    { id: 'bmb4mdg4d', kind: 'shell', start: '06:57:17.552', end: null },
+    { id: 'b2khaqeqq', kind: 'monitor', start: '07:08:46.367', end: null },
+  ]
+  const stopResult = (id: string) => ({ message: '…', task_id: id, task_type: 'local_bash', command: '…' })
+  const stopRow = (id: string, hms: string) =>
+    JSON.stringify({ parentUuid: 'u', isSidechain: false, promptId: 'p', type: 'user', message: { role: 'user', content: [{ tool_use_id: `toolu_stop_${id}`, type: 'tool_result', content: '…' }] }, uuid: 'u', timestamp: at(T, hms), toolUseResult: stopResult(id), sourceToolAssistantUUID: 'u', ...BASE })
+  // a notice that opened a turn is a user row of its own, so the replay has it too
+  const noticeRow = JSON.stringify({ parentUuid: 'u', isSidechain: false, promptId: 'p', type: 'user', message: { role: 'user', content: envelope('bgsy2gvie', 'completed') }, uuid: 'u', timestamp: at(T, '06:54:34.000'), origin: { kind: 'task-notification', producer: '…' }, ...BASE })
+  const lines = [...transcript(T, jobs, '08:13:36.924'), noticeRow, stopRow('bmb4mdg4d', '06:59:21.850'), stopRow('b2khaqeqq', '07:25:53.101')]
+  reloadWith(on, r, path, lines, jobs)
+  const rows = replay(jobs)
+  r.history = [
+    ...rows.slice(0, -4),
+    { role: 'user', text: envelope('bgsy2gvie', 'completed') },
+    ...['bmb4mdg4d', 'b2khaqeqq'].map(id => ({ role: 'assistant', text: '', toolUses: [{ tool: 'TaskStop', tool_use_id: `toolu_stop_${id}`, input: { task_id: id }, result: stopResult(id), text: '…' }] })),
+    ...rows.slice(-4),
+  ]
+  await $.session.start(START)
+  await r.clock.advance(5000)
+  const band = await bandText($)
+  expect(band).toContain('took 2 h 8 min')
+  expect(band).not.toContain('in background')
+  const out = JSON.stringify(await $.command.run({ command: 'builds-tasks', args: '' } as never))
+  const hhmm = (hms: string): string => {
+    const d = new Date(at(T, hms))
+
+    return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
+  }
+  expect(out).toContain('0 counted as running, 0 listed, 3 more ended before the reload.')
+  expect(out).toContain(`id bgsy2gvie · started ${hhmm('06:52:00.100')} · ended ${hhmm('06:54:34.000')} (completed) · last notice: bgsy2gvie completed · end read from the replayed history, its time from the transcript file`)
+  expect(out).toContain(`id bmb4mdg4d · started ${hhmm('06:57:17.552')} · ended ${hhmm('06:59:21.850')} (killed)`)
+  expect(out).toContain(`id b2khaqeqq · started ${hhmm('07:08:46.367')} · ended ${hhmm('07:25:53.101')} (killed)`)
+  expect(out).toContain('3 task ends in them; the transcript file gave 0 more and the time of 3 of those')
 })

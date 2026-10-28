@@ -264,8 +264,9 @@ export const register: Register = (on, options) => {
         const got = recoverAll({ ...status, started_at: Number.isFinite(launch) ? launch : now }, rows, now, hist)
         status = got.status
         found = got.ended
-        const byReplay = found.filter(f => f.from === 'replay').length
-        histNote = `At the reload: ${rows.length} messages replayed, ${byReplay} task end${byReplay === 1 ? '' : 's'} in them; ${hist ? `the transcript file gave ${found.length - byReplay} more` : 'the transcript file could not be read'}.`
+        const byReplay = found.filter(f => f.from !== 'file').length
+        const timed = found.filter(f => f.from === 'both').length
+        histNote = `At the reload: ${rows.length} messages replayed, ${byReplay} task end${byReplay === 1 ? '' : 's'} in them; ${hist ? `the transcript file gave ${found.length - byReplay} more and the time of ${timed} of those` : 'the transcript file could not be read'}.`
       }
     } catch {
       // no history to read: the title stays the folder
