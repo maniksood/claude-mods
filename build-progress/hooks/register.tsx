@@ -17,7 +17,7 @@ import {
   applyParsed,
   applyPlan,
   applyTool,
-  bandLine,
+  bandLines,
   bgFromCall,
   bgReport,
   bgRunning,
@@ -518,8 +518,12 @@ export const register: Register = (on, options) => {
     const now = await $.clock.now()
 
     return (
-      <Box>
-        <Text wrap="truncate">{bandLine(me, now)}</Text>
+      <Box flexDirection="column">
+        {bandLines(me, now).map((line, i) => (
+          <Text key={`band-${i}`} wrap="truncate">
+            {line}
+          </Text>
+        ))}
       </Box>
     )
   })

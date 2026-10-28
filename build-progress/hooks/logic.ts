@@ -731,24 +731,28 @@ const endLine = (s: Status, p: Progress, now: number): string | null => {
   return null
 }
 
-/** The band above the prompt, one line. */
-export const bandLine = (s: Status, now: number): string => {
+/** The band above the prompt as two lines: the main run, then the background tasks (absent when none runs). */
+export const bandLines = (s: Status, now: number): string[] => {
   const o = overallOf(s, now)
   const pctPart = o.pct === null ? '' : `📊 ${o.pct}% overall`
   const leftPart = o.left === null ? '' : `⏱ ${progressOf(s, now).basis?.kind === 'atmost' && o.noEstimate === 0 ? 'at most' : 'about'} ${fmtMin(o.left)} left${o.noEstimate > 0 ? ` (${o.noEstimate} background task${o.noEstimate === 1 ? '' : 's'} with no estimate)` : ''}`
   const back = bgBand(s, now)
+  const two = (main: string, second: string): string[] => [main, second].filter(x => x !== '🔄 ' && x !== '')
   const wait = waitLine(s, now)
-  if (wait) return [`⏳ Waiting on ${bgRunning(s, now).length} background task${bgRunning(s, now).length === 1 ? '' : 's'}`, pctPart, leftPart, back.replace(/^🔄 \d+ in background(?: \(\d+ with %\))?:? ?/, '🔄 ')].filter(x => x !== '🔄 ' && x !== '').join(' · ')
+  if (wait) return two([`⏳ Waiting on ${bgRunning(s, now).length} background task${bgRunning(s, now).length === 1 ? '' : 's'}`, pctPart, leftPart].filter(Boolean).join(' · '), back.replace(/^🔄 \d+ in background(?: \(\d+ with %\))?:? ?/, '🔄 '))
   const p = progressOf(s, now)
   const end = endLine(s, p, now)
-  if (end) return s.finished ? end : [end, pctPart].filter(Boolean).join(' · ')
+  if (end) return [s.finished ? end : [end, pctPart].filter(Boolean).join(' · ')]
   const emoji = EMOJI[stateOf(s, now)]
-  if (isPlain(s, now)) return [`${emoji === '😴' ? emoji : '🔨'} Working · Now: ${doingWords(s)} · ${stepsText(s.steps)} so far · ${runningText(p)}`, back].filter(Boolean).join(' · ')
-  if (p.pct === null) return [[emoji, leftText(p), runningText(p), ...workParts(s, true)].filter(Boolean).join(' · ').replace(`${emoji} · `, `${emoji} `), back].filter(Boolean).join(' · ')
+  if (isPlain(s, now)) return two(`${emoji === '😴' ? emoji : '🔨'} Working · Now: ${doingWords(s)} · ${stepsText(s.steps)} so far · ${runningText(p)}`, back)
+  if (p.pct === null) return two([emoji, leftText(p), runningText(p), ...workParts(s, true)].filter(Boolean).join(' · ').replace(`${emoji} · `, `${emoji} `), back)
   const work = workParts(s, true).join(' · ')
 
-  return [pctPart, leftPart, work === '' ? '' : `▶ ${work}`, back].filter(Boolean).join(' · ')
+  return two([pctPart, leftPart, work === '' ? '' : `▶ ${work}`].filter(Boolean).join(' · '), back)
 }
+
+/** The band as one line of text: its two lines joined. */
+export const bandLine = (s: Status, now: number): string => bandLines(s, now).join(' · ')
 
 export const KIND_ICON: Record<Bg['kind'], string> = { shell: '⌨️', agent: '🤖', monitor: '👁' }
 

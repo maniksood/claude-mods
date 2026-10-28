@@ -23,6 +23,7 @@ import {
   bgReport,
   watchOf,
   bandLine,
+  bandLines,
   bgLines,
   blankStatus,
   endBg,
@@ -330,6 +331,16 @@ describe('background tasks', () => {
     const s = startBg(startBg(six(), { id: 'a', toolUseId: '', kind: 'agent', label: 'A' }, NOW), { id: 'b', toolUseId: '', kind: 'monitor', label: 'B' }, NOW)
     expect(bandLine(s, NOW).startsWith('📊 46% overall')).toBe(true)
     expect(bandLine(s, NOW).endsWith('🔄 2 in background')).toBe(true)
+  })
+  test('the band is two lines: the main run, then the background tasks; one line when none runs', () => {
+    const s = startBg(startBg(six(), { id: 'a', toolUseId: '', kind: 'agent', label: 'A' }, NOW), { id: 'b', toolUseId: '', kind: 'monitor', label: 'B' }, NOW)
+    const [main, back, ...rest] = bandLines(s, NOW)
+    expect(main?.startsWith('📊 46% overall')).toBe(true)
+    expect(main).not.toContain('🔄')
+    expect(back).toBe('🔄 2 in background')
+    expect(rest).toEqual([])
+    expect(bandLines(six(), NOW)).toHaveLength(1)
+    expect(bandLines(shell({ finished: { at: NOW - 20 * MIN, verdict: 'turn ended', ok: true } }), NOW)).toEqual(['⏳ Waiting on 1 background task', '🔄 Run the full test matrix'])
   })
   test('finished ones move to the done list for 10 minutes, then go', () => {
     const s = endBg(shell(), { id: 'b1' }, 'completed', NOW - 5 * MIN)

@@ -46,10 +46,11 @@ Make a new folder beside `build-progress/` with its own `.claude-plugin/plugin.j
 
 ### What you see
 
-**The band** sits above the chat box, one line: overall %, overall time left, what the run is on, and the background tasks.
+**The band** sits above the chat box, in two lines, each cut at the window's edge on its own: overall %, overall time left and what the run is on; then the background tasks (the second line is left out when none runs).
 
 ```
-📊 57% overall · ⏱ about 4 h 48 min left · ▶ P5 wait for siblings · 🔄 1 in background: Watch sibling summaries 40%, ~12 min
+📊 57% overall · ⏱ about 4 h 48 min left · ▶ P5 wait for siblings
+🔄 1 in background: Watch sibling summaries 40%, ~12 min
 ```
 
 - `📊 57% overall`: the main run's % while it works. It is never 100% while anything still runs.
@@ -60,14 +61,16 @@ Make a new folder beside `build-progress/` with its own `.claude-plugin/plugin.j
 With **no checklist, no `▶` markers and no `EXPECT` line** (an ordinary session) there is no % to show, so the band says what is happening:
 
 ```
-🔨 Working · Now: Run the unit tests · 34 steps so far · running for at least 52 min · 🔄 1 in background: Build the index
+🔨 Working · Now: Run the unit tests · 34 steps so far · running for at least 52 min
+🔄 1 in background: Build the index
 ✅ Finished · 34 steps · took at least 52 min
 ```
 
 When the turn has ended but background work still runs, the band does not say Finished. The overall % is then the average of the tasks that report one:
 
 ```
-⏳ Waiting on 2 background tasks · 📊 58% overall · ⏱ about 12 min left · 🔄 40% ~12 min, 75% ~3 min
+⏳ Waiting on 2 background tasks · 📊 58% overall · ⏱ about 12 min left
+🔄 40% ~12 min, 75% ~3 min
 ```
 
 When the last one ends it says `✅ Finished · took N min`.
