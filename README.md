@@ -4,7 +4,7 @@ A collection of Claude Code mods.
 
 | Mod | What it does |
 | --- | --- |
-| `build-progress` | A panel and a band that show a session's % done, time left and status. |
+| `build-progress` | A panel and a band that show a session's % done, time left, status and background tasks. |
 
 ## Install on another Mac
 
@@ -52,6 +52,29 @@ Make a new folder beside `build-progress/` with its own `.claude-plugin/plugin.j
 🧬 46% ▰▰▰▰▰▱▱▱▱▱ · about 59 min left · Phase 2: api server · mutant 30/40
 ```
 
+With **no checklist, no `▶` markers and no `EXPECT` line** (an ordinary session) there is no % and no time left to show, so the band says what is happening instead:
+
+```
+🔨 Working · Now: Run the unit tests · 34 steps so far · running for at least 52 min
+✅ Finished · 34 steps · took at least 52 min
+```
+
+"Steps" are the tool calls made in the session (counted again from the session's history after a reload). "at least" appears when the start is not known.
+
+**Background tasks** (commands started in the background, background helpers, monitors) get a `🔄 N in background ·` count at the start of the band while any run:
+
+```
+🔄 2 in background · 🧪 38% ▰▰▰▰▱▱▱▱▱▱ · about 2 h 10 min left · Phase 2
+```
+
+When the turn has ended but background work still runs, the band does not say Finished:
+
+```
+⏳ Waiting on 1 background task · running for 23 min
+```
+
+(`Waiting on 2 background tasks` for more.) When the last one ends it says `✅ Finished · took N min`.
+
 **The Builds panel** has one card, for this session only:
 
 - the prompt id, with the small character beside it
@@ -59,7 +82,9 @@ Make a new folder beside `build-progress/` with its own `.claude-plugin/plugin.j
 - time left, and "running for N min"
 - what the run is on now (the open to-do item and its newest marker), and "Now: …"
 - the to-do list, with ✅ done, ▶ open, ○ waiting
+- the background tasks, under the to-do list (see below)
 - running helpers (👥)
+- in an ordinary session (no checklist, no `EXPECT`): the last 5 steps, with time, tool name and description, in place of the to-do list
 
 Example (a made-up session at 46%):
 
@@ -86,11 +111,27 @@ Example (a made-up session at 46%):
 
 On the desktop app the character is a small animated figure; in a terminal it is the emoji.
 
+### Background tasks in the panel
+
+Each task is one line: its description only (a Bash call's `description`, an agent's description, a monitor's description), never the command.
+
+```
+In the background
+🔄 Run the full test matrix · running for 23 min
+
+Done in the background
+✅ Run the full test matrix · took 41 min
+❌ Deploy preview · failed after 3 min
+```
+
+Finished tasks stay in "Done in the background" for 10 minutes, then disappear. A task whose end is never reported shows `❔ … · no news for 2 h` after 2 hours and is no longer counted as running. After a reload the list is rebuilt from the session's history: a background call with no completion is running (its time is kept from the status file when there is one). The mod only watches; it never starts, stops or changes a task.
+
 ### Open, close, reopen
 
 - The panel opens by itself when a session starts.
 - Close it with Esc then `ctrl+x x`, or its close mark.
 - It reopens at the next session start.
+- `/builds-panel` reopens it now (the same panel, never a second one) and answers with one line, `Opened the Builds panel.`
 - `/builds` prints, as plain text, every session that wrote a status file in the last 12 hours: emoji, prompt id, %, bar, time left, running time, the open item and what it is doing. Failed first, then working, quiet, finished.
 
 ### How % and time left are worked out

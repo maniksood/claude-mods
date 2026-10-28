@@ -5,21 +5,27 @@ import type { Status } from '../types'
 import { avatarSvg } from './art'
 import {
   ALL_DONE,
+  BG_DONE_MS,
   DELETE_MS,
   HEARTBEAT_MS,
   SESSION_CLOSED,
   STOPPED_BY_YOU,
   TURN_ENDED,
+  addStep,
   applyParsed,
   applyTool,
   bandLine,
+  bgFromCall,
+  bgRunning,
   blankStatus,
   branchFromHead,
   cardOf,
   colorFor,
+  endBg,
   expectFrom,
   homeShown,
   normalize,
+  parseNotice,
   parseText,
   promptIdFrom,
   recover,
@@ -28,6 +34,7 @@ import {
   scrub,
   setFolderLabels,
   settle,
+  startBg,
   toolNow,
   visibleRuns,
 } from './logic'
@@ -39,6 +46,8 @@ const mine = atom({ plugin: 'build-progress', key: 'mine' } as const, null as St
 const WRITE_EVERY_MS = 2000
 const CLOCK_MS = 30_000
 const TASK_TOOLS = ['TodoWrite', 'TaskCreate', 'TaskUpdate']
+
+const isBusy = (s: Status, now: number): boolean => s.tool_now !== null || s.subagents.length > 0 || bgRunning(s, now).length > 0
 
 type Eng = EngineInterface
 
@@ -144,6 +153,14 @@ export const register: Register = (on, options) => {
       // a reload starts from a blank status; the first prompt's time and the end time are kept from this session's own earlier file
       const old = normalize(JSON.parse(await $.fs.read(`${dir}/${sid}.json`)))
       if (old && old.session === sid) {
+        // background tasks: the history says what runs; this session's own earlier file knows when each began and what ended in the last 10 minutes
+        const known = status.bg.map(b => {
+          const was = old.bg.find(x => x.id === b.id || (b.tool_use_id !== '' && x.tool_use_id === b.tool_use_id))
+
+          return was ? { ...b, started_at: was.started_at } : b
+        })
+        const recent = old.bg.filter(x => x.ended_at !== null && now - x.ended_at <= BG_DONE_MS && !known.some(b => b.id === x.id))
+        status = { ...status, bg: [...known, ...recent] }
         if (old.start_known) status = { ...status, started_at: old.started_at, start_known: true }
         else if (old.started_at < status.started_at) status = { ...status, started_at: old.started_at }
         if (status.finished?.untimed && old.finished && !old.finished.untimed && old.finished.verdict !== ALL_DONE) {
@@ -155,12 +172,13 @@ export const register: Register = (on, options) => {
     }
     await writeNow($)
     await $.command.register({ name: 'builds', description: 'List every Claude Code session and its progress' })
+    await $.command.register({ name: 'builds-panel', description: 'Open the Builds panel' })
     void $.ui.open({ id: PANE, title: 'Builds' })
     void update($, nowAtom, () => now)
     $.clock.every(CLOCK_MS, () => void $.clock.now().then(t => update($, nowAtom, () => t)))
     // a long tool call or helper writes nothing on its own: the heartbeat says the run is alive
     $.clock.every(HEARTBEAT_MS, () => {
-      if (status && (status.tool_now || status.subagents.length > 0)) void change($, s => s, true)
+      if (status) void $.clock.now().then(t => status && isBusy(status, t) && change($, s => s, true))
     })
 
     return next(e)
@@ -182,6 +200,13 @@ export const register: Register = (on, options) => {
     const text = list.length === 0 ? 'No sessions have written a status file in the last 12 hours.' : list.flatMap(s => runLines(s, now)).join('\n')
 
     return { text }
+  })
+
+  // same pane id: opening it again re-seats the one pane, never a second
+  on('command.run', { command: 'builds-panel' }, async $ => {
+    await $.ui.open({ id: PANE, title: 'Builds' })
+
+    return { text: 'Opened the Builds panel.' }
   })
 
   on('prompt.submit', async ($, e, next) => {
@@ -225,6 +250,21 @@ export const register: Register = (on, options) => {
     return next(e)
   })
 
+  // A background task ends with a notification row: its id and status are read from the envelope, nothing else.
+  on('session.append', async ($, e, next) => {
+    if (!e.agentId && e.origin.kind === 'task-notification') {
+      const content: unknown = e.message.content
+      const text = typeof content === 'string' ? content : (Array.isArray(content) ? content : []).flatMap(b => (b && typeof b === 'object' && 'text' in b ? [String(b.text)] : [])).join('\n')
+      const notice = parseNotice(text)
+      if (notice) {
+        const now = await $.clock.now()
+        await change($, s => endBg(s, notice, notice.status, now))
+      }
+    }
+
+    return next(e)
+  })
+
   on('tool.call', async ($, e, next) => {
     if (e.agentId) {
       await change($, s => s)
@@ -232,11 +272,23 @@ export const register: Register = (on, options) => {
       return next(e)
     }
     const startedAt = await $.clock.now()
-    await change($, s => ({ ...s, tool_now: toolNow(e), tool_since: startedAt }))
+    const call = toolNow(e)
+    await change($, s => addStep({ ...s, tool_now: call, tool_since: startedAt }, { ...call, at: startedAt }))
     const ran = await next(e)
+    const isDenied = 'deny' in ran && !!ran.deny
     // the session's to-do list is carried by these three tools' calls
-    const isList = TASK_TOOLS.includes(e.tool) && !('deny' in ran && ran.deny)
-    await change($, s => ({ ...s, tool_now: null, tool_since: null, tasks: isList ? applyTool(s.tasks, e.tool, e, ran.result) : s.tasks }))
+    const isList = TASK_TOOLS.includes(e.tool) && !isDenied
+    const endedAt = await $.clock.now()
+    // a background command or monitor is told by its call's result; the task's end comes later, from its notification
+    const started = isDenied ? null : bgFromCall(e.tool, e, ran.result, e.tool_use_id ?? '')
+    const stopped = !isDenied && e.tool === 'TaskStop' && typeof e.task_id === 'string' ? e.task_id : ''
+    await change($, s => {
+      let out: Status = { ...s, tool_now: null, tool_since: null, tasks: isList ? applyTool(s.tasks, e.tool, e, ran.result) : s.tasks }
+      if (started) out = startBg(out, started, endedAt)
+      if (stopped) out = endBg(out, { id: stopped }, 'killed', endedAt)
+
+      return out
+    })
 
     return ran
   })
@@ -244,19 +296,29 @@ export const register: Register = (on, options) => {
   on('agent.spawn', async ($, e, next) => {
     const key = e.tool_use_id || `sub-${Date.now()}`
     const now = await $.clock.now()
-    await change($, s => ({
-      ...s,
-      subagents: [...s.subagents.filter(x => x.id !== key), { id: key, description: scrub(e.description, 60), started_at: now }],
-    }))
+    const isBg = e.background === true
+    const label = scrub(e.description, 60)
+    // a background agent is listed with the background tasks; the others stay helpers
+    await change($, s =>
+      isBg
+        ? startBg(s, { id: key, toolUseId: e.tool_use_id || '', kind: 'agent', label }, now)
+        : { ...s, subagents: [...s.subagents.filter(x => x.id !== key), { id: key, description: label, started_at: now }] },
+    )
     let result
     try {
       result = await next(e)
     } catch (err) {
-      await change($, s => ({ ...s, subagents: s.subagents.filter(x => x.id !== key) }))
+      await change($, s => ({ ...s, subagents: s.subagents.filter(x => x.id !== key), bg: s.bg.filter(x => x.id !== key) }))
       throw err
     }
     const agentId = 'agentId' in result ? result.agentId : undefined
-    if (agentId) await change($, s => ({ ...s, subagents: s.subagents.map(x => (x.id === key ? { ...x, id: agentId } : x)) }))
+    if (agentId) {
+      await change($, s =>
+        isBg
+          ? startBg(s, { id: agentId, toolUseId: e.tool_use_id || '', kind: 'agent', label }, now)
+          : { ...s, subagents: s.subagents.map(x => (x.id === key ? { ...x, id: agentId } : x)) },
+      )
+    }
 
     return result
   })
@@ -264,7 +326,9 @@ export const register: Register = (on, options) => {
   on('turn.complete', async ($, e, next) => {
     const id = e.agentId
     if (id) {
-      await change($, s => ({ ...s, subagents: s.subagents.filter(x => x.id !== id) }))
+      const now = await $.clock.now()
+      const word = e.reason === 'aborted' ? 'killed' : e.reason === 'error' || e.reason === 'refusal' ? 'failed' : 'completed'
+      await change($, s => endBg({ ...s, subagents: s.subagents.filter(x => x.id !== id) }, { id }, word, now))
     } else {
       const failed = e.reason === 'error' || e.reason === 'refusal'
       const stopped = e.reason === 'aborted'
@@ -310,16 +374,44 @@ export const register: Register = (on, options) => {
           <Text bold>{c.title}</Text>
         </Box>
         {c.pct !== '' && <Text bold>{c.pct}</Text>}
-        <Text>{c.bar}</Text>
+        {c.bar !== '' && <Text>{c.bar}</Text>}
         <Text>{c.end ?? c.left}</Text>
         <Text dimColor>{c.running}</Text>
         {c.work !== '' && <Text bold>{c.work}</Text>}
         {c.doing !== '' && <Text>{c.doing}</Text>}
-        {me.tasks.length > 0 && (
+        {c.plain && c.steps.length > 0 && (
+          <Box flexDirection="column" marginTop={1}>
+            <Text bold>Last steps</Text>
+            {c.steps.map((line, i) => (
+              <Text key={`s-${i}`} dimColor>
+                {line}
+              </Text>
+            ))}
+          </Box>
+        )}
+        {!c.plain && me.tasks.length > 0 && (
           <Box flexDirection="column" marginTop={1}>
             {me.tasks.map(t => (
               <Text key={`t-${t.id}`} bold={t.status === 'in_progress'} dimColor={t.status === 'pending'}>
                 {`${mark(t.status)} ${t.subject}`}
+              </Text>
+            ))}
+          </Box>
+        )}
+        {c.bg.running.length > 0 && (
+          <Box flexDirection="column" marginTop={1}>
+            <Text bold>In the background</Text>
+            {c.bg.running.map((line, i) => (
+              <Text key={`b-${i}`}>{line}</Text>
+            ))}
+          </Box>
+        )}
+        {c.bg.done.length > 0 && (
+          <Box flexDirection="column" marginTop={1}>
+            <Text bold>Done in the background</Text>
+            {c.bg.done.map((line, i) => (
+              <Text key={`g-${i}`} dimColor>
+                {line}
               </Text>
             ))}
           </Box>

@@ -4,7 +4,7 @@ import type { Engine } from 'claude-code/testing'
 const HOME = '/Users/tester'
 const DIR = `${HOME}/.claude/build-progress`
 
-type Rig = { ask: boolean; results: Record<string, unknown>; history: unknown[]; launch: number; files: Map<string, string>; toasts: string[]; sounds: string[]; snaps: string[]; writes: number; settle: boolean; hold: number; clock: ReturnType<typeof mock.clock> }
+type Rig = { ask: boolean; results: Record<string, unknown>; history: unknown[]; launch: number; files: Map<string, string>; toasts: string[]; sounds: string[]; snaps: string[]; opened: string[]; writes: number; settle: boolean; hold: number; clock: ReturnType<typeof mock.clock> }
 type On = Parameters<typeof mock.session>[0]
 
 const rig = (on: On, sid = 's1'): Rig => {
@@ -12,7 +12,7 @@ const rig = (on: On, sid = 's1'): Rig => {
   const toasts: string[] = []
   const sounds: string[] = []
   const snaps: string[] = []
-  const r = { ask: false, results: {} as Record<string, unknown>, history: [] as unknown[], launch: 0, files, toasts, sounds, snaps, writes: 0, settle: true, hold: 0, clock: undefined as never } as Rig
+  const r = { ask: false, results: {} as Record<string, unknown>, history: [] as unknown[], launch: 0, files, toasts, sounds, snaps, opened: [] as string[], writes: 0, settle: true, hold: 0, clock: undefined as never } as Rig
   const clock = mock.clock(on)
   mock.env(on, { HOME })
   on('session.id', () => ({ value: sid }))
@@ -35,7 +35,11 @@ const rig = (on: On, sid = 's1'): Rig => {
       .map(([p, t]) => ({ name: p.slice(DIR.length + 1), kind: 'file' as const, size: t.length, mtimeMs: clock.now(), isLink: false })),
   }))
   on('command.register', () => ({ value: { command: 'builds' } }))
-  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('ui.open', (_, e) => {
+    r.opened.push(e.id)
+
+    return { value: { isPlaced: true } }
+  })
   on('ui.toast', (_, e) => {
     toasts.push(e.text)
 
@@ -390,4 +394,171 @@ test('a turn the person stops shows Stopped by you', async ($, on) => {
   await $.turn.complete({ turnId: 'x', reason: 'aborted', isAborted: true, text: '', answer: '' } as never)
   await r.clock.advance(31_000)
   expect(await bandText($)).toContain('⏸ Stopped by you · after 12 min')
+})
+
+const notice = (id: string, status = 'completed') => ({
+  message: { type: 'user', content: [{ type: 'text', text: `<task-notification><task-id>${id}</task-id><status>${status}</status><summary>done</summary></task-notification>` }] },
+  door: 'queue',
+  origin: { kind: 'task-notification' },
+  uuid: `u-${id}-${status}`,
+}) as never
+
+const SECRET_CMD = 'curl -H "x: sk-live-AbCdEf1234567890XyZ" https://example.test'
+
+test('a background Bash: listed, counted, then moved to Done for 10 minutes, then gone; the command never appears', async ($, on) => {
+  const r = rig(on)
+  r.results.Bash = { backgroundTaskId: 'b1', stdout: '' }
+  await $.session.start(START)
+  await $.prompt.submit({ text: '# MOD-X\nEXPECT: 3 h' } as never)
+  await $.tool.call({ tool: 'Bash', tool_use_id: 'tu1', command: SECRET_CMD, description: 'Run the full test matrix', run_in_background: true } as never)
+  await r.clock.advance(23 * 60_000)
+  expect(await bandText($)).toContain('🔄 1 in background')
+  let ui = await mountPane($)
+  let all = await texts(ui)
+  expect(all).toMatch(/🔄 Run the full test matrix · running for 2[34] min/)
+  await ui.unmount()
+  await r.clock.advance(18 * 60_000)
+  await $.session.append(notice('b1'))
+  await r.clock.advance(31_000)
+  expect(await bandText($)).not.toContain('in background')
+  ui = await mountPane($)
+  all = await texts(ui)
+  expect(all).toContain('Done in the background')
+  expect(all).toMatch(/✅ Run the full test matrix · took 4[12] min/)
+  expect(all).not.toContain('sk-live')
+  expect([...r.files.values()].join('\n') + all).not.toContain('sk-live')
+  await ui.unmount()
+  await r.clock.advance(11 * 60_000)
+  ui = await mountPane($)
+  expect(await texts(ui)).not.toContain('Run the full test matrix')
+  await ui.unmount()
+})
+
+test('two background tasks at once count 2', async ($, on) => {
+  const r = rig(on)
+  await $.session.start(START)
+  r.results.Bash = { backgroundTaskId: 'b1' }
+  await $.tool.call({ tool: 'Bash', tool_use_id: 'tu1', command: 'a', description: 'First', run_in_background: true } as never)
+  r.results.Monitor = { taskId: 'm1', timeoutMs: 0 }
+  await $.tool.call({ tool: 'Monitor', tool_use_id: 'tu2', description: 'Watch the log', timeout_ms: 1000, command: 'tail -f x' } as never)
+  await r.clock.advance(31_000)
+  expect(await bandText($)).toContain('🔄 2 in background')
+})
+
+test('the turn ends while one runs: Waiting, not Finished; when it ends: Finished', async ($, on) => {
+  const r = rig(on)
+  r.results.Bash = { backgroundTaskId: 'b1' }
+  await $.session.start(START)
+  await $.prompt.submit({ text: '# MOD-X\nEXPECT: 3 h' } as never)
+  await $.tool.call({ tool: 'Bash', tool_use_id: 'tu1', command: 'x', description: 'Run the full test matrix', run_in_background: true } as never)
+  await r.clock.advance(5 * 60_000)
+  await $.turn.complete({ turnId: 'x', reason: 'answer', text: 'ok', answer: 'ok' } as never)
+  await r.clock.advance(31_000)
+  const waiting = await bandText($)
+  expect(waiting).toMatch(/⏳ Waiting on 1 background task · running for [56] min/)
+  expect(waiting).not.toContain('Finished')
+  let ui = await mountPane($)
+  expect(await texts(ui)).not.toContain('Finished')
+  await ui.unmount()
+  await r.clock.advance(5 * 60_000)
+  await $.session.append(notice('b1'))
+  await r.clock.advance(31_000)
+  expect(await bandText($)).toMatch(/✅ Finished · took 1\d min/)
+  ui = await mountPane($)
+  expect(await texts(ui)).toContain('✅ Finished')
+  await ui.unmount()
+})
+
+test('a background agent is listed, keeps the turn from Finished, and ends with its own turn', async ($, on) => {
+  const r = rig(on)
+  await $.session.start(START)
+  await $.prompt.submit({ text: '# MOD-X\nEXPECT: 3 h' } as never)
+  await $.agent.spawn({ tool_use_id: 't1', prompt: 'p', description: 'Check every page', subagentType: 'Explore', background: true, provider: { plugin: 'engine', tier: 'core' } } as never)
+  await $.turn.complete({ turnId: 'x', reason: 'answer', text: 'ok', answer: 'ok' } as never)
+  await r.clock.advance(31_000)
+  expect(await bandText($)).toContain('⏳ Waiting on 1 background task')
+  const ui = await mountPane($)
+  const all = await texts(ui)
+  expect(all).toContain('🔄 Check every page')
+  expect(all).not.toContain('👥')
+  await ui.unmount()
+  await $.turn.complete({ turnId: 'y', reason: 'answer', agentId: 'agent-1', text: 'ok' } as never)
+  await r.clock.advance(31_000)
+  expect(await bandText($)).toContain('✅ Finished')
+})
+
+test('a reload with one open background call: running, count 1, not Finished', async ($, on) => {
+  const r = rig(on)
+  r.history = [
+    { role: 'user', text: '# MOD-X\nEXPECT: 3 h', toolUses: [] },
+    { role: 'assistant', text: '', toolUses: [{ tool: 'Bash', tool_use_id: 'tu1', input: { description: 'Run the full test matrix', command: SECRET_CMD, run_in_background: true }, result: { backgroundTaskId: 'b1' } }] },
+    { role: 'assistant', text: 'The matrix is running.', toolUses: [] },
+  ]
+  r.launch = r.clock.now() - 30 * 60_000
+  await $.session.start(START)
+  await r.clock.advance(31_000)
+  const band = await bandText($)
+  expect(band).toContain('Waiting on 1 background task')
+  expect(band).not.toContain('Finished')
+  const ui = await mountPane($)
+  const all = await texts(ui)
+  expect(all).toContain('🔄 Run the full test matrix')
+  expect(all).not.toContain('sk-live')
+  await ui.unmount()
+})
+
+test('a background task with no news for 2 hours stops counting as running', async ($, on) => {
+  const r = rig(on)
+  r.results.Bash = { backgroundTaskId: 'b1' }
+  await $.session.start(START)
+  await $.prompt.submit({ text: '# MOD-X\nEXPECT: 9 h' } as never)
+  await $.tool.call({ tool: 'Bash', tool_use_id: 'tu1', command: 'x', description: 'Never reports', run_in_background: true } as never)
+  await r.clock.advance(121 * 60_000)
+  expect(await bandText($)).not.toContain('in background')
+  const ui = await mountPane($)
+  expect(await texts(ui)).toContain('❔ Never reports · no news for 2 h')
+  await ui.unmount()
+})
+
+test('an ordinary session: Working with steps live and from history, the last 5 steps in the panel', async ($, on) => {
+  const r = rig(on)
+  r.history = [
+    { role: 'user', text: 'fix the bug', toolUses: [] },
+    { role: 'assistant', text: 'ok', toolUses: [{ tool: 'Read', input: { file_path: '/a/one.ts' } }, { tool: 'Bash', input: { command: 'ls', description: 'List files' } }] },
+    { role: 'assistant', text: 'working', toolUses: [{ tool: 'Edit', input: { file_path: '/a/two.ts' }, result: {} }, { tool: 'Bash', input: { description: 'Run the unit tests' } }] },
+  ]
+  r.launch = r.clock.now() - 20 * 60_000
+  await $.session.start(START)
+  await r.clock.advance(31_000)
+  await $.tool.call({ tool: 'Bash', command: 'npm test', description: 'Run the unit tests' } as never)
+  await $.tool.call({ tool: 'Read', file_path: '/a/three.ts' } as never)
+  await r.clock.advance(31_000)
+  const band = await bandText($)
+  expect(band).toContain('🔨 Working')
+  expect(band).toContain('6 steps so far')
+  expect(band).not.toContain('% not reported')
+  expect(band).not.toContain('time left not known yet')
+  const ui = await mountPane($)
+  const all = await texts(ui)
+  expect(all).toContain('Last steps')
+  expect(all).toContain('Read · three.ts')
+  expect(all).not.toContain('one.ts')
+  expect(all).not.toContain('% not reported')
+  expect(all).not.toContain('time left not known yet')
+  expect(all).not.toContain('npm test')
+  await ui.unmount()
+  await $.turn.complete({ turnId: 'x', reason: 'answer', text: 'done', answer: 'done' } as never)
+  await r.clock.advance(31_000)
+  expect(await bandText($)).toMatch(/✅ Finished · 6 steps · took (at least )?\d+ min/)
+})
+
+test('/builds-panel reopens the one pane and says so; /builds still prints the list', async ($, on) => {
+  const r = rig(on)
+  await $.session.start(START)
+  const a = await $.command.run({ command: 'builds-panel', args: '' } as never)
+  const b = await $.command.run({ command: 'builds-panel', args: '' } as never)
+  expect(JSON.stringify(a)).toContain('Opened the Builds panel.')
+  expect(JSON.stringify(b)).toContain('Opened the Builds panel.')
+  expect(new Set(r.opened)).toEqual(new Set(['builds']))
+  expect(JSON.stringify(await $.command.run({ command: 'builds', args: '' } as never))).toContain('claude-mods')
 })

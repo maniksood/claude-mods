@@ -1,4 +1,4 @@
-import type { Finish, Marker, Status, Task } from '../types'
+import type { Bg, Finish, Marker, Status, Step, Task } from '../types'
 
 export const QUIET_MS = 10 * 60_000
 export const STALE_TOOL_MS = 15 * 60_000
@@ -8,6 +8,10 @@ export const DELETE_MS = 2 * 24 * 3_600_000
 export const ALL_DONE = 'all items done'
 export const EARLY_PCT = 10
 export const MIN_LEFT = 5
+export const BG_DONE_MS = 10 * 60_000
+export const BG_CAP_MS = 2 * 3_600_000
+export const BG_KEEP = 20
+export const STEPS_KEPT = 5
 
 export type RunState = 'building' | 'testing' | 'mutation' | 'quiet' | 'done' | 'failed'
 
@@ -80,7 +84,90 @@ export const blankStatus = (session: string, folder: string, branch: string, now
   alive_at: now,
   subagents: [],
   finished: null,
+  bg: [],
+  steps: 0,
+  recent: [],
 })
+
+/** A background task that has not ended and is within the 2-hour cap. */
+export const isBgRunning = (b: Bg, now: number): boolean => b.ended_at === null && now - b.started_at <= BG_CAP_MS
+
+export const bgRunning = (s: Status, now: number): Bg[] => s.bg.filter(b => isBgRunning(b, now))
+
+/** Not ended, and no news for 2 hours: no longer counted as running. */
+export const bgStale = (s: Status, now: number): Bg[] => s.bg.filter(b => b.ended_at === null && now - b.started_at > BG_CAP_MS)
+
+export const bgDone = (s: Status, now: number): Bg[] => s.bg.filter(b => b.ended_at !== null && now - b.ended_at <= BG_DONE_MS)
+
+export const pruneBg = (list: Bg[], now: number): Bg[] =>
+  list.filter(b => b.ended_at === null || now - b.ended_at <= BG_DONE_MS).slice(-BG_KEEP)
+
+export type BgStart = { id: string; toolUseId: string; kind: Bg['kind']; label: string }
+
+/** A background task begins (or is seen again under a better id). */
+export const startBg = (s: Status, b: BgStart, now: number): Status => {
+  const old = s.bg.find(x => x.id === b.id || (b.toolUseId !== '' && x.tool_use_id === b.toolUseId))
+  const made: Bg = { id: b.id, tool_use_id: b.toolUseId, kind: b.kind, label: b.label, started_at: old?.started_at ?? now, ended_at: null, ok: null, end: null }
+
+  return { ...s, bg: pruneBg([...s.bg.filter(x => x !== old), made], now) }
+}
+
+const TERMINAL = /^(completed|failed|killed|stopped|cancell?ed|error|timed?[_ -]?out|done|finished)$/
+
+/** A task ends. The word is the notification's own status; an unknown task changes nothing. */
+export const endBg = (s: Status, key: { id?: string; toolUseId?: string }, status: string, now: number): Status => {
+  const hit = s.bg.find(b => b.ended_at === null && ((key.id && b.id === key.id) || (key.toolUseId && b.tool_use_id === key.toolUseId)))
+  if (!hit) return s
+  const word = scrub(status, 20).toLowerCase()
+  const bg = s.bg.map(b => (b === hit ? { ...b, ended_at: now, ok: word === 'completed' || word === 'done' || word === 'finished', end: word } : b))
+  const next = { ...s, bg: pruneBg(bg, now) }
+  // the last one ends after the turn: the finish moves to now
+  const finished = next.finished?.ok && bgRunning(next, now).length === 0 ? { ...next.finished, at: now } : next.finished
+
+  return { ...next, finished }
+}
+
+export type Notice = { id?: string; toolUseId?: string; status: string }
+
+/** Reads a task notification's `<task-id>`, `<tool-use-id>` and `<status>`; null when it names no task or has no end status. */
+export const parseNotice = (text: string): Notice | null => {
+  const tag = (n: string): string | undefined => new RegExp(`<${n}>\\s*([^<]*?)\\s*</${n}>`).exec(text)?.[1]
+  const id = tag('task-id')
+  const toolUseId = tag('tool-use-id')
+  const status = (tag('status') ?? '').toLowerCase()
+  if ((!id && !toolUseId) || !TERMINAL.test(status)) return null
+
+  return { ...(id ? { id: scrub(id, 64) } : {}), ...(toolUseId ? { toolUseId: scrub(toolUseId, 64) } : {}), status }
+}
+
+/** The background task a finished tool call started, or null. Label is a description or name, never a command. */
+export const bgFromCall = (tool: string, input: unknown, result: unknown, toolUseId: string): BgStart | null => {
+  const i = (input ?? {}) as Record<string, unknown>
+  const r = (result ?? {}) as Record<string, unknown>
+  const text = (v: unknown, max: number, fallback: string): string => (typeof v === 'string' && v.trim() !== '' ? scrub(v, max) : fallback)
+  if (tool === 'Bash') {
+    const id = typeof r.backgroundTaskId === 'string' && r.backgroundTaskId !== '' ? r.backgroundTaskId : ''
+    if (!id && !(i.run_in_background === true && result === undefined)) return null
+
+    return { id: id || toolUseId, toolUseId, kind: 'shell', label: text(i.description, 70, 'Background command') }
+  }
+  if (tool === 'Monitor') {
+    const id = typeof r.taskId === 'string' && r.taskId !== '' ? r.taskId : toolUseId
+
+    return { id, toolUseId, kind: 'monitor', label: text(i.description, 70, 'Monitor') }
+  }
+  if (tool === 'Agent' || tool === 'Task') {
+    if (r.status === 'async_launched' && typeof r.agentId === 'string') return { id: r.agentId, toolUseId, kind: 'agent', label: text(i.description, 70, 'Background agent') }
+    if (r.status === 'remote_launched' && typeof r.taskId === 'string') return { id: r.taskId, toolUseId, kind: 'agent', label: text(i.description, 70, 'Background agent') }
+  }
+
+  return null
+}
+
+/** One more tool call by the main loop. */
+export const addStep = (s: Status, step: Step): Status => ({ ...s, steps: s.steps + 1, recent: [...s.recent, step].slice(-STEPS_KEPT) })
+
+export const stepsText = (n: number): string => `${n} step${n === 1 ? '' : 's'}`
 
 const MARK = /^\s*▶\s*([A-Za-z][\w-]*)\s+(\d+)\s*\/\s*(\d+)(.*)$/
 const END = /^\s*▶\s*(done|finished|failed|stopped)\b[\s:—–-]*(.*)$/i
@@ -239,9 +326,11 @@ export const branchFromHead = (head: string): string => {
 }
 
 const isTool = (s: Status, now: number): boolean =>
-  (s.tool_now !== null || s.subagents.length > 0) && now - s.alive_at <= STALE_TOOL_MS
+  (s.tool_now !== null || s.subagents.length > 0 || bgRunning(s, now).length > 0) && now - s.alive_at <= STALE_TOOL_MS
 
 export const stateOf = (s: Status, now: number): RunState => {
+  // the turn is over but a background task runs: waiting, not done
+  if (s.finished?.ok && bgRunning(s, now).length > 0) return 'quiet'
   if (s.finished) return s.finished.ok ? 'done' : 'failed'
   if (!isTool(s, now) && now - s.updated_at > QUIET_MS) return 'quiet'
   const current = s.tasks.find(t => t.status === 'in_progress')
@@ -349,10 +438,15 @@ export const progressOf = (s: Status, now: number): Progress => {
   return { pct, left: null, isFromEstimate: false, elapsed, isAtLeast }
 }
 
-export const NOT_REPORTED = '% not reported'
+/** The % alone; empty when there is no checklist. */
+export const pctText = (p: Progress): string => (p.pct !== null ? `${p.pct}%` : '')
 
-/** The % alone; with no checklist it is empty, or says so only when nothing else (time left) is known either. */
-export const pctText = (p: Progress): string => (p.pct !== null ? `${p.pct}%` : p.left === null ? NOT_REPORTED : '')
+/** No checklist, no markers and no usable EXPECT: neither % nor time left is known. */
+export const isPlain = (s: Status, now: number): boolean => {
+  const p = progressOf({ ...s, finished: null }, now)
+
+  return p.pct === null && p.left === null
+}
 
 export const leftText = (p: Progress): string =>
   p.left === null ? 'time left not known yet' : `about ${fmtMin(p.left)} left${p.isFromEstimate ? ' (from the estimate)' : ''}`
@@ -395,11 +489,24 @@ export const doingWords = (s: Status): string => {
 
 const quietMin = (s: Status, now: number): number => Math.floor((now - s.updated_at) / 60_000)
 
+/** `⏳ Waiting on 1 background task · running for 23 min` while the turn is over and a background task runs, else null. */
+export const waitLine = (s: Status, now: number): string | null => {
+  const run = bgRunning(s, now)
+  if (!s.finished?.ok || run.length === 0) return null
+  const oldest = Math.min(...run.map(b => b.started_at))
+
+  return `⏳ Waiting on ${run.length} background task${run.length === 1 ? '' : 's'} · running for ${fmtMin((now - oldest) / 60_000)}`
+}
+
 /** `✅ Finished · took 2 h 41 min`, `❌ Stopped …`, `😴 Quiet for 12 min`, or null while working. */
 const endLine = (s: Status, p: Progress, now: number): string | null => {
   const st = stateOf(s, now)
   const took = s.finished ? `${p.isAtLeast ? 'at least ' : ''}${fmtMin((s.finished.at - s.started_at) / 60_000)}` : ''
-  if (st === 'done') return s.finished?.untimed ? '✅ Finished' : `✅ Finished · took ${took}`
+  if (st === 'done') {
+    const steps = isPlain(s, now) ? ` · ${stepsText(s.steps)}` : ''
+
+    return s.finished?.untimed ? `✅ Finished${steps}` : `✅ Finished${steps} · took ${took}`
+  }
   if (s.finished?.verdict === STOPPED_BY_YOU) return `⏸ Stopped by you · after ${took}`
   if (st === 'failed') return `❌ Stopped${p.pct === null ? '' : ` at ${p.pct}%`} · after ${took}`
   if (st === 'quiet') return `😴 Quiet for ${quietMin(s, now)} min`
@@ -408,37 +515,66 @@ const endLine = (s: Status, p: Progress, now: number): string | null => {
 
 /** The band above the prompt, one line. */
 export const bandLine = (s: Status, now: number): string => {
+  const wait = waitLine(s, now)
+  if (wait) return wait
   const p = progressOf(s, now)
   const end = endLine(s, p, now)
+  const n = bgRunning(s, now).length
+  const prefix = n > 0 ? `🔄 ${n} in background · ` : ''
   const bar = p.pct === null ? '' : `${p.pct}% ${barText(p.pct)}`
   if (end) return s.finished ? end : [end, bar].filter(Boolean).join(' · ')
   const emoji = EMOJI[stateOf(s, now)]
-  if (p.pct === null) return [emoji, ...(p.left === null ? [NOT_REPORTED, leftText(p)] : [leftText(p)]), runningText(p), ...workParts(s, true)].join(' · ').replace(`${emoji} · `, `${emoji} `)
-  return [`${emoji} ${bar}`, leftText(p), ...workParts(s, true)].join(' · ')
+  if (isPlain(s, now)) return `${prefix}${emoji === '😴' ? emoji : '🔨'} Working · Now: ${doingWords(s)} · ${stepsText(s.steps)} so far · ${runningText(p)}`
+  if (p.pct === null) return prefix + [emoji, leftText(p), runningText(p), ...workParts(s, true)].join(' · ').replace(`${emoji} · `, `${emoji} `)
+  return prefix + [`${emoji} ${bar}`, leftText(p), ...workParts(s, true)].join(' · ')
 }
+
+/** The panel's background lists, as plain lines: those running (or without news) and those that ended in the last 10 minutes. */
+export const bgLines = (s: Status, now: number): { running: string[]; done: string[] } => ({
+  running: [
+    ...bgRunning(s, now).map(b => `🔄 ${b.label} · running for ${fmtMin((now - b.started_at) / 60_000)}`),
+    ...bgStale(s, now).map(b => `❔ ${b.label} · no news for 2 h`),
+  ],
+  done: bgDone(s, now).map(b => {
+    const min = fmtMin(((b.ended_at ?? now) - b.started_at) / 60_000)
+
+    return b.ok ? `✅ ${b.label} · took ${min}` : `❌ ${b.label} · ${b.end === 'killed' ? 'stopped' : 'failed'} after ${min}`
+  }),
+})
+
+/** The last steps as plain lines: time (when known), tool name, description. */
+export const stepLines = (s: Status): string[] =>
+  s.recent.map(r => `${r.at > 0 ? `${fmtClock(r.at)} ` : ''}${r.name}${r.detail ? ` · ${r.detail}` : ''}`)
 
 /** The lines of a card as plain data (the pane and /builds). */
 export const cardOf = (s: Status, now: number) => {
   const st = stateOf(s, now)
   const p = progressOf(s, now)
+  const plain = isPlain(s, now)
+  const wait = waitLine(s, now)
+  const over = st === 'done' || st === 'failed' || wait !== null
+
   return {
     state: st,
-    emoji: EMOJI[st],
+    emoji: wait ? '⏳' : EMOJI[st],
     title: titleOf(s),
+    plain,
     pct: pctText(p),
-    bar: barText(p.pct),
-    left: leftText(p),
+    bar: plain ? '' : barText(p.pct),
+    left: plain ? `Working · ${stepsText(s.steps)} so far` : leftText(p),
     running: runningText(p),
-    end: endLine(s, p, now),
+    end: wait ?? endLine(s, p, now),
     work: workParts(s).join(' · '),
-    doing: st === 'done' || st === 'failed' ? '' : `Now: ${doingWords(s)}`,
+    doing: over ? '' : `Now: ${doingWords(s)}`,
+    bg: bgLines(s, now),
+    steps: stepLines(s),
   }
 }
 
 /** Plain-text lines for one run, used by /builds. */
 export const runLines = (s: Status, now: number): string[] => {
   const c = cardOf(s, now)
-  const lines = [`${c.emoji} ${c.title}${c.pct ? `  ${c.pct}` : ''}`, `   ${c.bar}  ${c.end ?? `${c.left} · ${c.running}`}`]
+  const lines = [`${c.emoji} ${c.title}${c.pct ? `  ${c.pct}` : ''}`, `   ${c.bar ? `${c.bar}  ` : ''}${c.end ?? `${c.left} · ${c.running}`}`]
   if (c.work) lines.push(`   ${c.work}`)
   if (c.doing) lines.push(`   ${c.doing}`)
   return lines
@@ -453,7 +589,7 @@ export const visibleRuns = (list: Status[], now: number, showFinished: boolean):
     .sort((a, b) => RANK[stateOf(a, now)] - RANK[stateOf(b, now)] || b.updated_at - a.updated_at)
 
 /** Reads this session's earlier rows once: the first prompt's id, role and EXPECT, the to-do list, the markers. */
-export type Row = { role: string; text?: string; toolUses?: { tool?: string; input?: unknown; result?: unknown; text?: unknown }[] }
+export type Row = { role: string; text?: string; toolUses?: { tool?: string; tool_use_id?: string; input?: unknown; result?: unknown; text?: unknown }[] }
 
 export const recover = (s: Status, rows: readonly Row[], now: number): Status => {
   let out = s
@@ -462,16 +598,35 @@ export const recover = (s: Status, rows: readonly Row[], now: number): Status =>
     out = { ...out, prompt_id: promptIdFrom(first.text), role: roleFrom(first.text), expect_h: expectFrom(first.text) }
   }
   for (const r of rows) {
+    if (r.role === 'user') {
+      // a background task's notification is a user row that opens with its envelope
+      if (typeof r.text === 'string' && r.text.trimStart().startsWith('<task-notification')) {
+        const n = parseNotice(r.text)
+        if (n) out = endBg(out, n, n.status, now)
+      }
+      continue
+    }
     if (r.role !== 'assistant') continue
     if (typeof r.text === 'string' && r.text.includes('▶')) out = applyParsed(out, parseText(r.text, now), now)
     for (const t of r.toolUses ?? []) {
+      const tool = String(t.tool ?? 'tool')
+      const call = toolNow({ tool, ...((t.input ?? {}) as object) })
+      out = addStep(out, { name: call.name, detail: call.detail, at: 0 })
       if (t.tool === 'TodoWrite' || t.tool === 'TaskCreate' || t.tool === 'TaskUpdate') {
         out = settle({ ...out, tasks: applyTool(out.tasks, t.tool, t.input, t.result) }, now)
       }
+      const started = bgFromCall(tool, t.input, t.result, String(t.tool_use_id ?? ''))
+      if (started) out = startBg({ ...out }, started, out.started_at)
+      if (tool === 'TaskStop') {
+        const id = ((t.input ?? {}) as Record<string, unknown>).task_id
+        if (typeof id === 'string') out = endBg(out, { id }, 'killed', now)
+      }
     }
   }
+  // what ended before the reload is not known to the minute: only the running ones are rebuilt (the status file's own earlier copy adds the recent ones)
+  out = { ...out, bg: out.bg.filter(b => b.ended_at === null) }
   const lastRow = rows[rows.length - 1]
-  const open = lastRow?.role === 'assistant' ? lastRow.toolUses?.find(t => t.result === undefined && t.text === undefined) : undefined
+  const open = lastRow?.role === 'assistant' ? lastRow.toolUses?.find(t => t.result === undefined && t.text === undefined && t.tool !== 'Monitor' && (t.input as Record<string, unknown> | undefined)?.run_in_background !== true) : undefined
   // the last row is the assistant's final answer and nothing is open: the turn is over, when it ended is not in the history
   if (!open && !out.finished && lastRow?.role === 'assistant' && typeof lastRow.text === 'string' && lastRow.text.trim() !== '') {
     out = { ...out, finished: { at: now, verdict: TURN_ENDED, ok: true, untimed: true } }
@@ -540,5 +695,16 @@ export const normalize = (raw: unknown): Status | null => {
       fin && typeof fin === 'object' && num(fin.at) !== null
         ? { at: fin.at as number, verdict: str(fin.verdict, 60), ok: fin.ok === true, ...(fin.untimed === true ? { untimed: true as const } : {}) }
         : null,
+    bg: Array.isArray(r.bg)
+      ? r.bg.slice(-BG_KEEP).flatMap((b: Record<string, unknown>) =>
+          b && num(b.started_at) !== null && (b.kind === 'shell' || b.kind === 'agent' || b.kind === 'monitor')
+            ? [{ id: str(b.id, 64), tool_use_id: str(b.tool_use_id, 64), kind: b.kind, label: str(b.label, 70), started_at: b.started_at as number, ended_at: num(b.ended_at), ok: typeof b.ok === 'boolean' ? b.ok : null, end: typeof b.end === 'string' ? str(b.end, 20) : null }]
+            : [],
+        )
+      : [],
+    steps: num(r.steps) ?? 0,
+    recent: Array.isArray(r.recent)
+      ? r.recent.slice(-STEPS_KEPT).flatMap((x: Record<string, unknown>) => (x && typeof x.name === 'string' ? [{ name: str(x.name, 40), detail: str(x.detail, 80), at: num(x.at) ?? 0 }] : []))
+      : [],
   }
 }

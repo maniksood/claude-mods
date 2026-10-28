@@ -7,7 +7,14 @@ import {
   applyParsed,
   applyTool,
   bandLine,
+  bgLines,
   blankStatus,
+  endBg,
+  parseNotice,
+  startBg,
+  waitLine,
+  addStep,
+  stepLines,
   cardOf,
   expectFrom,
   normalize,
@@ -175,7 +182,7 @@ describe('finished and quiet', () => {
   })
   test('a ▶ done line finishes with no to-do list', () => {
     const s = applyParsed(base({ started_at: NOW - 10 * MIN }), parseText('▶ done all green', NOW), NOW)
-    expect(bandLine(s, NOW)).toBe('✅ Finished · took 10 min')
+    expect(bandLine(s, NOW)).toBe('✅ Finished · 0 steps · took 10 min')
   })
   test('quiet after 10 minutes with nothing running; the percent stays', () => {
     const s = six({ updated_at: NOW - 12 * MIN, alive_at: NOW - 12 * MIN })
@@ -216,14 +223,16 @@ describe('/builds text and history', () => {
     const rows = [{ role: 'user', text: 'MOD-3 · x' }, { role: 'assistant', text: 'All done.', toolUses: [] }]
     const s = recover(base({ prompt_id: '—' }), rows, NOW)
     expect(s.finished?.untimed).toBe(true)
-    expect(bandLine(s, NOW)).toBe('✅ Finished')
+    expect(bandLine(s, NOW)).toBe('✅ Finished · 0 steps')
     const open = recover(base({ prompt_id: '—' }), [...rows.slice(0, 1), { role: 'assistant', text: 'Running', toolUses: [{ tool: 'Bash', input: {} }] }], NOW)
     expect(open.finished).toBeNull()
     expect(open.tool_now?.name).toBe('Bash')
   })
   test('an unknown start says "at least" and gives no time left', () => {
     const s = base({ start_known: false, expect_h: 1 })
-    expect(bandLine(s, NOW)).toContain('time left not known yet')
+    // EXPECT with an unknown start gives no time left, and no checklist: the plain band, not the old phrases
+    expect(bandLine(s, NOW)).not.toContain('time left not known yet')
+    expect(bandLine(s, NOW)).toContain('running for at least 26 min')
     expect(runLines(s, NOW).join('\n')).toContain('running for at least 26 min')
   })
   test('a stop by the person reads Stopped by you', () => {
@@ -256,5 +265,96 @@ describe('folder labels', () => {
     expect(folderName('/Users/tester/Work/project-c', labels)).toBe('project-c')
     expect(parseFolderLabels('')).toEqual([])
     expect(parseFolderLabels('junk')).toEqual([])
+  })
+})
+
+const shell = (over: Partial<Status> = {}, label = 'Run the full test matrix', ago = 23): Status =>
+  startBg(base(over), { id: 'b1', toolUseId: 'tu1', kind: 'shell', label }, NOW - ago * MIN)
+
+describe('ordinary sessions: no checklist, no markers, no EXPECT', () => {
+  test('the band says what is happening and never the two old phrases', () => {
+    let s = base({ tool_now: { name: 'Bash', detail: 'Run the unit tests' } })
+    for (let i = 0; i < 34; i++) s = addStep(s, { name: 'Bash', detail: '', at: NOW })
+    const line = bandLine(s, NOW)
+    expect(line).toBe('🔨 Working · Now: Run the unit tests · 34 steps so far · running for 26 min')
+    for (const t of [line, ...runLines(s, NOW), JSON.stringify(cardOf(s, NOW))]) {
+      expect(t).not.toContain('% not reported')
+      expect(t).not.toContain('time left not known yet')
+    }
+  })
+  test('between tools it says Thinking; an unknown start says at least', () => {
+    const s = base({ start_known: false })
+    expect(bandLine(s, NOW)).toBe('🔨 Working · Now: Thinking · 0 steps so far · running for at least 26 min')
+  })
+  test('finished: steps and minutes', () => {
+    let s = base({ start_known: false, finished: { at: NOW, verdict: 'turn ended', ok: true } })
+    for (let i = 0; i < 34; i++) s = addStep(s, { name: 'Read', detail: 'a.ts', at: NOW })
+    expect(bandLine(s, NOW)).toBe('✅ Finished · 34 steps · took at least 26 min')
+  })
+  test('steps are counted from the history, and the last 5 keep name and description only', () => {
+    const uses = Array.from({ length: 7 }, (_, i) => ({ tool: 'Bash', input: { command: 'echo sk-live-AbCdEf1234567890XyZ', description: `Step ${i + 1}` } }))
+    const s = recover(base(), [{ role: 'user', text: 'hello' }, { role: 'assistant', text: 'ok', toolUses: uses }], NOW)
+    expect(s.steps).toBe(7)
+    expect(stepLines(s)).toEqual(['Bash · Step 3', 'Bash · Step 4', 'Bash · Step 5', 'Bash · Step 6', 'Bash · Step 7'])
+    expect(JSON.stringify(s)).not.toContain('sk-live')
+  })
+  test('a checklist still shows its percent and no steps line', () => {
+    expect(bandLine(six(), NOW)).toContain('46%')
+    expect(cardOf(six(), NOW).plain).toBe(false)
+  })
+})
+
+describe('background tasks', () => {
+  test('one running: listed with its description, counted in the band', () => {
+    const s = shell({ tool_now: { name: 'Bash', detail: 'Run the unit tests' } })
+    expect(bgLines(s, NOW).running).toEqual(['🔄 Run the full test matrix · running for 23 min'])
+    expect(bandLine(s, NOW)).toMatch(/^🔄 1 in background · 🔨 Working · Now: Run the unit tests/)
+  })
+  test('the count sits in front of a checklist line too', () => {
+    const s = startBg(startBg(six(), { id: 'a', toolUseId: '', kind: 'agent', label: 'A' }, NOW), { id: 'b', toolUseId: '', kind: 'monitor', label: 'B' }, NOW)
+    expect(bandLine(s, NOW).startsWith('🔄 2 in background · 🧬 46% ▰▰▰▰▰▱▱▱▱▱')).toBe(true)
+  })
+  test('finished ones move to the done list for 10 minutes, then go', () => {
+    const s = endBg(shell(), { id: 'b1' }, 'completed', NOW - 5 * MIN)
+    expect(bgLines(s, NOW).done).toEqual(['✅ Run the full test matrix · took 18 min'])
+    expect(bgLines(s, NOW).running).toEqual([])
+    expect(bgLines(s, NOW + 6 * MIN).done).toEqual([])
+    const bad = endBg(shell({}, 'Deploy', 4), { toolUseId: 'tu1' }, 'failed', NOW - MIN)
+    expect(bgLines(bad, NOW).done).toEqual(['❌ Deploy · failed after 3 min'])
+  })
+  test('turn over with one running is Waiting, never Finished; the last end finishes', () => {
+    const over = shell({ finished: { at: NOW - 20 * MIN, verdict: 'turn ended', ok: true } })
+    expect(bandLine(over, NOW)).toBe('⏳ Waiting on 1 background task · running for 23 min')
+    expect(waitLine(startBg(over, { id: 'b2', toolUseId: '', kind: 'agent', label: 'x' }, NOW), NOW)).toContain('Waiting on 2 background tasks')
+    const ended = endBg(over, { id: 'b1' }, 'completed', NOW)
+    expect(waitLine(ended, NOW)).toBeNull()
+    expect(bandLine(ended, NOW)).toMatch(/^✅ Finished · 0 steps · took 26 min$/)
+  })
+  test('no completion row for 2 hours: "no news", no longer counted as running', () => {
+    const s = shell({}, 'Old job', 121)
+    expect(bgLines(s, NOW).running).toEqual(['❔ Old job · no news for 2 h'])
+    expect(bandLine(s, NOW)).not.toContain('in background')
+  })
+  test('a notification names its task and status; one without an end status names none', () => {
+    expect(parseNotice('<task-notification><task-id>b1</task-id><tool-use-id>tu1</tool-use-id><status>completed</status><summary>x</summary></task-notification>')).toEqual({ id: 'b1', toolUseId: 'tu1', status: 'completed' })
+    expect(parseNotice('<task-notification><task-id>m1</task-id><status>running</status></task-notification>')).toBeNull()
+    expect(parseNotice('nothing here')).toBeNull()
+  })
+  test('a reload rebuilds from the history: an open background call runs, a finished one is gone', () => {
+    const rows = [
+      { role: 'user', text: 'go' },
+      { role: 'assistant', text: '', toolUses: [{ tool: 'Bash', tool_use_id: 'tu1', input: { description: 'Long build', run_in_background: true, command: 'make SECRET=hunter2hunter2' }, result: { backgroundTaskId: 'b1' } }, { tool: 'Bash', tool_use_id: 'tu2', input: { description: 'Quick job', run_in_background: true }, result: { backgroundTaskId: 'b2' } }] },
+      { role: 'user', text: '<task-notification><task-id>b2</task-id><status>completed</status></task-notification>' },
+      { role: 'assistant', text: 'Waiting for the build.', toolUses: [] },
+    ]
+    const s = recover(base(), rows, NOW)
+    expect(s.bg.map(b => b.label)).toEqual(['Long build'])
+    expect(bandLine(s, NOW)).toMatch(/^⏳ Waiting on 1 background task/)
+    expect(JSON.stringify(s)).not.toContain('hunter2')
+  })
+  test('the file keeps labels, never commands', () => {
+    const s = recover(base(), [{ role: 'user', text: 'go' }, { role: 'assistant', text: '', toolUses: [{ tool: 'Bash', tool_use_id: 't', input: { command: 'curl -H "Authorization: Bearer abc123abc123abc123abc123abc123abc123"', run_in_background: true }, result: { backgroundTaskId: 'b' } }] }], NOW)
+    expect(JSON.stringify(s)).not.toContain('abc123')
+    expect(s.bg[0]?.label).toBe('Background command')
   })
 })

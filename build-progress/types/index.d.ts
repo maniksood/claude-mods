@@ -2,6 +2,22 @@ export type Marker = { kind: string; n: number; N: number; at: number; line: str
 export type Sub = { id: string; description: string; started_at: number }
 /** `untimed`: the end is known but not when, so no minutes are shown. */
 export type Finish = { at: number; verdict: string; ok: boolean; untimed?: true }
+/** One background task: a command started in the background, a background subagent or a monitor. `label` is its description or name, never a command. */
+export type Bg = {
+  /** The task's id (a shell's or monitor's `taskId`, an agent's `agentId`); the call's `tool_use_id` until the id is known. */
+  id: string
+  tool_use_id: string
+  kind: 'shell' | 'agent' | 'monitor'
+  label: string
+  started_at: number
+  /** null while it runs (or until the 2-hour cap shows "no news"). */
+  ended_at: number | null
+  ok: boolean | null
+  /** `completed`, `failed` or `killed`, when it ended. */
+  end: string | null
+}
+/** One tool call: its name and its description or file name, never a command. `at` is 0 when a reload could not know. */
+export type Step = { name: string; detail: string; at: number }
 /** One item of the session's own to-do list; `mark` is the newest `▶ kind n/N` seen while it was in progress. */
 export type Task = {
   id: string
@@ -37,6 +53,12 @@ export type Status = {
   alive_at: number
   subagents: Sub[]
   finished: Finish | null
+  /** Background tasks: running ones and those that ended in the last 10 minutes. */
+  bg: Bg[]
+  /** Tool calls made by the main loop in this session. */
+  steps: number
+  /** The last 5 tool calls. */
+  recent: Step[]
 }
 
 declare module 'claude-code' {
