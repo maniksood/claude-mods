@@ -17,7 +17,15 @@ export type Bg = {
   end: string | null
   /** The status word of the last notification seen for it (id and status only). */
   seen: string | null
+  /** Its own % (0..100) from `▶ x n/N`, `NN%` or its checklist; null when it reports none. */
+  pct: number | null
+  /** When its own "N min left" / ETA line says it will end (ms); null when it says nothing. */
+  eta_at: number | null
+  /** When `pct` / `eta_at` were last read. */
+  prog_at: number | null
 }
+/** The run's own newest status line: its % and when it says it will end. */
+export type Report = { at: number; pct: number | null; eta_at: number | null }
 /** One tool call: its name and its description or file name, never a command. `at` is 0 when a reload could not know. */
 export type Step = { name: string; detail: string; at: number }
 /** One item of the session's own to-do list; `mark` is the newest `▶ kind n/N` seen while it was in progress. */
@@ -63,6 +71,12 @@ export type Status = {
   recent: Step[]
   /** The first share of the work seen since the mod loaded; the speed for the time left is read from it. */
   watch: { at: number; frac: number } | null
+  /** The newest status line the run printed (`56% · ~288 min left`). */
+  report: Report | null
+  /** When the checklist's share last changed. */
+  tasks_at: number
+  /** The session's name in the app's sidebar, read from its transcript; '' when unknown. */
+  title: string
 }
 
 declare module 'claude-code' {

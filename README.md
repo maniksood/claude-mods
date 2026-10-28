@@ -46,85 +46,81 @@ Make a new folder beside `build-progress/` with its own `.claude-plugin/plugin.j
 
 ### What you see
 
-**The band** sits above the chat box. One line: emoji · % · bar · time left · what it is doing.
+**The band** sits above the chat box, one line: overall %, overall time left, what the run is on, and the background tasks.
 
 ```
-🧬 46% ▰▰▰▰▰▱▱▱▱▱ · about 59 min left · Phase 2: api server · mutant 30/40
+📊 57% overall · ⏱ about 4 h 48 min left · ▶ P5 wait for siblings · 🔄 1 in background: Watch sibling summaries 40%, ~12 min
 ```
 
-With **no checklist, no `▶` markers and no `EXPECT` line** (an ordinary session) there is no % and no time left to show, so the band says what is happening instead:
+- `📊 57% overall`: the main run's % while it works. It is never 100% while anything still runs.
+- `⏱ about 4 h 48 min left`: the **longest** of the main run's time left and every running background task's time left (the session is not done until all are). If a running task has no time left known, the band says so: `⏱ about 4 h 48 min left (1 background task with no estimate)`. With an `EXPECT` line and an unknown start it says `at most …`.
+- `▶ …`: the open item of the checklist and its newest marker.
+- `🔄 …`: one task shows its name, its % and its time left. Several show `🔄 3 in background (2 with %): 40% ~12 min, 75% ~3 min, …` (three at most; the panel lists all).
+
+With **no checklist, no `▶` markers and no `EXPECT` line** (an ordinary session) there is no % to show, so the band says what is happening:
 
 ```
-🔨 Working · Now: Run the unit tests · 34 steps so far · running for at least 52 min
+🔨 Working · Now: Run the unit tests · 34 steps so far · running for at least 52 min · 🔄 1 in background: Build the index
 ✅ Finished · 34 steps · took at least 52 min
 ```
 
-"Steps" are the tool calls made in the session (counted again from the session's history after a reload). "at least" appears when the start is not known.
-
-**Background tasks** (commands started in the background, background helpers, monitors) get a `🔄 N in background ·` count at the start of the band while any run:
+When the turn has ended but background work still runs, the band does not say Finished. The overall % is then the average of the tasks that report one:
 
 ```
-🔄 2 in background · 🧪 38% ▰▰▰▰▱▱▱▱▱▱ · about 2 h 10 min left · Phase 2
+⏳ Waiting on 2 background tasks · 📊 58% overall · ⏱ about 12 min left · 🔄 40% ~12 min, 75% ~3 min
 ```
 
-When the turn has ended but background work still runs, the band does not say Finished:
+When the last one ends it says `✅ Finished · took N min`.
 
-```
-⏳ Waiting on 1 background task · running for 23 min
-```
+**The Builds panel** is for this session only, top to bottom:
 
-(`Waiting on 2 background tasks` for more.) When the last one ends it says `✅ Finished · took N min`.
-
-**The Builds panel** has one card, for this session only:
-
-- the prompt id, with the small character beside it
-- the big %, and the bar
-- time left, and "running for N min"
-- what the run is on now (the open to-do item and its newest marker), and "Now: …"
-- the to-do list, with ✅ done, ▶ open, ○ waiting
-- the background tasks, under the to-do list (see below)
-- running helpers (👥)
-- in an ordinary session (no checklist, no `EXPECT`): the last 5 steps, with time, tool name and description, in place of the to-do list
-
-Example (a made-up session at 46%):
+1. **The session's name** (from the app's sidebar) with the small character beside it; with no name, the prompt id; with none, the folder and branch.
+2. **Overall**: the big %, the bar, `about 4 h 48 min left overall (1 background task with no estimate)`, `running for 1 h 18 min`.
+3. **Main run**: its %, its time left with where it comes from (`(from the run)`, `(from the estimate)`, `(from the last N min)`, `(from the pace so far)`), the open item and marker, `Now: …`, then the checklist with ✅ done, ▶ open, ○ waiting (in an ordinary session, the last 5 steps instead).
+4. **In the background**: one row per running task: icon (⌨️ command, 🤖 agent, 👁 monitor), name, `40% ▰▰▰▱▱▱▱▱` or `no % reported`, `running for N min` (from the task's own start), and its time left when known (`from its own line` or `from its pace`).
+5. **Done in the background** (last 10 minutes).
+6. Running helpers (👥).
 
 ```
 ╭──────────────────────────────────────────────╮
-│ 🧬  DEMO-1                                    │
-│ 46%                                          │
-│ ▰▰▰▰▰▱▱▱▱▱                                   │
-│ about 59 min left                            │
-│ running for 50 min                           │
-│ Phase 2: api server · mutant 30 of 40        │
-│ Now: Running mutants against the server      │
+│ 🧬  GQ3B form losing areas                    │
 │                                              │
-│ ✅ Step 0: read the prompt                    │
-│ ✅ Phase 1: schema                            │
-│ ▶ Phase 2: api server                        │
-│ ○ Phase 3: runs                              │
-│ ○ Phase 4: report                            │
-│ ○ Write and print final report               │
+│ Overall                                      │
+│ 57%                                          │
+│ ▰▰▰▰▰▰▱▱▱▱                                   │
+│ about 4 h 48 min left overall                │
+│ running for 1 h 18 min                       │
 │                                              │
-│ 👥 Mutation runner 2 · 0 min                  │
+│ Main run                                     │
+│ 57%  ▰▰▰▰▰▰▱▱▱▱                              │
+│ about 4 h 48 min left (from the run)         │
+│ P5 wait for siblings                         │
+│ Now: Waiting for a helper                    │
+│                                              │
+│ ✅ P4: merge                                  │
+│ ▶ P5 wait for siblings                       │
+│ ○ P6: report                                 │
+│                                              │
+│ In the background                            │
+│ 🤖 Watch sibling summaries · 40% ▰▰▰▱▱▱▱▱ ·  │
+│    running for 5 min · about 12 min left     │
+│    (from its pace)                           │
+│ ⌨️ Build the index · no % reported · running  │
+│    for 21 min                                │
 ╰──────────────────────────────────────────────╯
 ```
 
 On the desktop app the character is a small animated figure; in a terminal it is the emoji.
 
-### Background tasks in the panel
+### Background tasks
 
-Each task is one line: its description only (a Bash call's `description`, an agent's description, a monitor's description), never the command.
+Each task is one row with its description only (a Bash call's `description`, an agent's description, a monitor's description), never the command. Finished tasks stay in "Done in the background" for 10 minutes, then disappear. A task whose end is never reported shows `❔ … · no news for 2 h` after 2 hours and is no longer counted as running.
 
-```
-In the background
-🔄 Run the full test matrix · running for 23 min
+How the mod knows a task ended: the app writes a "finished" row (an `attachment` row of kind `queued_command` that opens with a `<task-notification>` envelope holding `<task-id>` and `<status>`). The mod reads that row live. It also reads the session's transcript file with `grep` (ids, status words and clock times only; no message text is kept) when the session starts and about once a minute while a task runs, so a notice it missed, or one that came before a reload, still ends the task, and each task shows **its own start time**, not the time of the reload. The same read gives the session's name.
 
-Done in the background
-✅ Run the full test matrix · took 41 min
-❌ Deploy preview · failed after 3 min
-```
+How a task's % is found: a background agent from its own checklist (`TodoWrite`, `update_plan`, `TaskCreate`) and its `▶ x n/N` lines; a background command from the **last lines of its output file** (the app's `tasks/<id>.output`), read only to find a `▶ x n/N` marker, an `NN%` figure or an `N min left` / `ETA hh:mm` line. The output itself is never shown or stored. A task that prints none of these shows `no % reported`.
 
-Finished tasks stay in "Done in the background" for 10 minutes, then disappear. A task whose end is never reported shows `❔ … · no news for 2 h` after 2 hours and is no longer counted as running. After a reload the list is rebuilt from the session's history: a background call with no completion is running (its time is kept from the status file when there is one). The mod only watches; it never starts, stops or changes a task. `/builds-tasks` prints this session's background tasks with each one's start and the last notification seen for it (task id and status only), and any notification that named no listed task.
+The mod only watches; it never starts, stops or changes a task. `/builds-tasks` prints this session's background tasks with each one's start, its matched end (time and status word), and the last notification seen for it (task id and status only), and any notification that named no listed task.
 
 ### Open, close, reopen
 
@@ -136,20 +132,30 @@ Finished tasks stay in "Done in the background" for 10 minutes, then disappear. 
 
 ### How % and time left are worked out
 
-- **%** comes from the session's own to-do list (TodoWrite, TaskCreate/TaskUpdate, or the desktop app's own task list, `update_plan`), read live and again from the history after a reload. It is shown whether or not the start is known: (items done + the open item's `n/N`) ÷ items. The open item's `n/N` is the newest `▶ x n/N` marker. With no to-do list it uses the `▶ phase n/N` markers.
-- **Time left** comes from the prompt header's `EXPECT: <hours> h` until the run is 10% done: `EXPECT − time running` (never below 5 min). It is then shown as "(from the estimate)".
-- From 10% done on, it uses the real speed: time running × (100 − %) ÷ %.
-- With no `EXPECT` line and under 10%, it says "time left not known yet".
-- When the start of the session is not known (a reload in a long run), the time left comes from the speed the mod has seen since it loaded: after at least 10 minutes watched and with the % moved, `about N min left (from the last N min)`. Before that, with an `EXPECT` line, `at most N min left (from the estimate)`; with neither, no time-left phrase is shown.
+**Main run %**: from the session's own to-do list (TodoWrite, TaskCreate/TaskUpdate, or the desktop app's `update_plan`), read live and again from the history after a reload: (items done + the open item's `n/N`) ÷ items. The open item's `n/N` is the newest `▶ x n/N` marker. With no to-do list it uses `▶ phase n/N` markers. If the run prints its own **status line** with a %, the newer of the two wins.
+
+**A status line** is a line that names a time left (`~288 min left`, `288 min left`, `about 288 min left`, `4 h 48 min left`, `4h48m left`, `ETA 17:45`) or starts with a clock time and carries a %, for example `12:51 · P5 waiting · 56% · ~288 min left`.
+
+**Main run time left**, the first that applies:
+
+1. the run's own newest status line, while it is under 15 minutes old: `(from the run)`;
+2. `EXPECT: <hours> h` minus the time running (never below 5 min): `(from the estimate)`; with an unknown start, `at most N min left`;
+3. from 10% done on, the real pace: time running × (100 − %) ÷ %: `(from the pace so far)`; with an unknown start, the speed the mod has seen since it loaded, after 10 minutes watched and with the % moved: `(from the last N min)`.
+
+**Each background task's time left**: its own `N min left` / `ETA` line, else its pace (after 2 minutes running, with a %): time running × (100 − %) ÷ %. Otherwise none.
+
+**Overall time left**: the longest of the main run's and every running task's. **Overall %**: the main run's % while it works; once its checklist is done and only background tasks run, the average % of the tasks that report one; never 100% while anything runs.
+
 - The plain `Working · N steps` form is used only when there is no to-do list at all.
 - "Running for N min" counts from the first prompt (or, in a session reloaded with history, from the session's launch).
 
-### How to write a prompt so the panel shows it well
+### How to make your runs show well
 
 - Put a header line `EXPECT: 4 h`.
-- Ask the run to keep a to-do list, one item per phase.
-- Ask it to print markers with counts: `▶ phase n/N` at each phase, `▶ <step> n/N` inside it (for example `▶ mutant 30/40`).
-- Ask it to print `▶ done` (or `▶ failed`) at the end.
+- Keep a checklist (to-do list), one item per phase.
+- Print markers with counts: `▶ phase n/N` at each phase, `▶ <step> n/N` inside it (for example `▶ mutant 30/40`), and `▶ done` (or `▶ failed`) at the end.
+- Print a status line now and then, such as `56% · ~288 min left` (or `12:51 · P5 waiting · 56% · ETA 17:45`).
+- Make background commands print `▶ x n/N` or `NN%` lines (and, if you can, `N min left`); background agents should keep their own checklist.
 
 Example header:
 
@@ -158,7 +164,7 @@ Example header:
 MODEL: Opus   EFFORT: high
 EXPECT: 4 h
 Keep a to-do list with one item per phase.
-Print "▶ phase n/N" at each phase and "▶ <step> n/N" for counted steps, and "▶ done" last.
+Print "▶ phase n/N" at each phase and "▶ <step> n/N" for counted steps, a status line like "56% · ~288 min left" every 10 minutes, and "▶ done" last.
 ```
 
 The prompt id is the first word of the first `#` heading, else a first line like `MOD-3 · …`, else a `.md` path in the prompt; with none, the folder and branch.
@@ -191,11 +197,12 @@ Optional. A comma-separated list of `path-suffix=label` pairs that gives folders
 
 - A window that was already running needs `/reload-plugins` after an update.
 - A run started before the mod was installed shows only from its next step.
-- Time left is a guess until the run is 10% done.
+- Time left is a guess until the run prints a status line with a time left, or is 10% done.
+- Reading the transcript and a task's output uses `grep` and `tail` on this Mac. If they cannot run, the mod falls back to what it saw live: tasks then start at the reload and show no % for commands.
 
 ## Privacy
 
-The mod writes status files only to `~/.claude/build-progress/`, never sends anything anywhere, and never shows commands, file contents or secrets.
+The mod writes status files only to `~/.claude/build-progress/`, never sends anything anywhere, and never shows commands, file contents or secrets. It reads this session's own transcript and its background tasks' output files only to find ids, status words, clock times, the session's name and progress figures; none of that text is shown or kept.
 
 ## Licence
 

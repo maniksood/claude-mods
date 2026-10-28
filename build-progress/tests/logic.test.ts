@@ -1,10 +1,21 @@
 import { describe, expect, test } from 'claude-code/testing'
 
-import type { Status, Task } from '../types'
+import type { Bg, Status, Task } from '../types'
 import { avatarSvg } from '../hooks/art'
 import {
   ALL_DONE,
+  applyHist,
   applyParsed,
+  bgBand,
+  bgDone,
+  bgLeft,
+  overallLeftText,
+  overallOf,
+  parseHist,
+  parseLeft,
+  parseReport,
+  scanProgress,
+  setBgProgress,
   applyTool,
   applyPlan,
   isPlanTool,
@@ -99,7 +110,7 @@ describe('whole-prompt percent', () => {
 describe('time left', () => {
   test('before 10%: EXPECT minus elapsed, shown as from the estimate', () => {
     const s = base({ expect_h: 4, tasks: [task(1, 'in_progress'), ...[2, 3, 4, 5, 6, 7, 8, 9, 10, 11].map(i => task(i, 'pending'))] })
-    expect(bandLine(s, NOW)).toContain('about 3 h 34 min left (from the estimate)')
+    expect(bandLine(s, NOW)).toContain('⏱ about 3 h 34 min left')
     expect(cardOf(s, NOW).left).toBe('about 3 h 34 min left (from the estimate)')
   })
   test('before 10% the estimate never goes below 5 min', () => {
@@ -110,17 +121,17 @@ describe('time left', () => {
     const s = six({ started_at: NOW - 50 * MIN, expect_h: 9 })
     // 46%: 50 × 54 / 46 = 58.7 min
     expect(Math.round((progressOf(s, NOW).left ?? 0) * 10) / 10).toBe(58.7)
-    expect(cardOf(s, NOW).left).toBe('about 59 min left')
+    expect(cardOf(s, NOW).left).toBe('about 59 min left (from the pace so far)')
   })
   test('exactly 10% switches to elapsed-based', () => {
     const s = base({ started_at: NOW - 30 * MIN, expect_h: 5, tasks: [{ ...task(1, 'in_progress'), mark: { kind: 'x', n: 1, N: 1 } }, ...[2, 3, 4, 5, 6, 7, 8, 9, 10].map(i => task(i, 'pending'))] })
     expect(progressOf(s, NOW).pct).toBe(10)
-    expect(cardOf(s, NOW).left).toBe('about 4 h 30 min left')
+    expect(cardOf(s, NOW).left).toBe('about 4 h 30 min left (from the pace so far)')
   })
   test('no EXPECT and under 10%: not known yet', () => {
     const s = base({ tasks: [task(1, 'in_progress'), ...[2, 3, 4, 5, 6, 7, 8, 9, 10, 11].map(i => task(i, 'pending'))] })
     expect(cardOf(s, NOW).left).toBe('time left not known yet')
-    expect(bandLine(s, NOW)).toContain('time left not known yet')
+    expect(bandLine(s, NOW)).not.toContain('⏱')
   })
   test('elapsed counts from the first prompt, not from the mod load', () => {
     expect(cardOf(base({ started_at: NOW - 26 * MIN }), NOW).running).toBe('running for 26 min')
@@ -153,7 +164,7 @@ describe('the to-do list from the task tools', () => {
 describe('status of the work', () => {
   test('the band is one line in the agreed shape', () => {
     const s = six({ started_at: NOW - 50 * MIN, tool_now: { name: 'Bash', detail: 'Running mutants' }, alive_at: NOW })
-    expect(bandLine(s, NOW)).toBe('🧬 46% ▰▰▰▰▰▱▱▱▱▱ · about 59 min left · Phase 2: api server · mutant 30/40')
+    expect(bandLine(s, NOW)).toBe('📊 46% overall · ⏱ about 59 min left · ▶ Phase 2: api server · mutant 30/40')
   })
   test('the card says the item, the marker and what runs now', () => {
     const c = cardOf(six({ tool_now: { name: 'Bash', detail: 'Running mutants' }, alive_at: NOW }), NOW)
@@ -191,7 +202,7 @@ describe('finished and quiet', () => {
   })
   test('quiet after 10 minutes with nothing running; the percent stays', () => {
     const s = six({ updated_at: NOW - 12 * MIN, alive_at: NOW - 12 * MIN })
-    expect(bandLine(s, NOW)).toBe('😴 Quiet for 12 min · 46% ▰▰▰▰▰▱▱▱▱▱')
+    expect(bandLine(s, NOW)).toBe('😴 Quiet for 12 min · 📊 46% overall')
     expect(cardOf(s, NOW).pct).toBe('46%')
   })
   test('a running tool with a fresh heartbeat is not quiet', () => {
@@ -312,12 +323,13 @@ describe('ordinary sessions: no checklist, no markers, no EXPECT', () => {
 describe('background tasks', () => {
   test('one running: listed with its description, counted in the band', () => {
     const s = shell({ tool_now: { name: 'Bash', detail: 'Run the unit tests' } })
-    expect(bgLines(s, NOW).running).toEqual(['🔄 Run the full test matrix · running for 23 min'])
-    expect(bandLine(s, NOW)).toMatch(/^🔄 1 in background · 🔨 Working · Now: Run the unit tests/)
+    expect(bgLines(s, NOW).running).toEqual(['⌨️ Run the full test matrix · no % reported · running for 23 min'])
+    expect(bandLine(s, NOW)).toMatch(/^🔨 Working · Now: Run the unit tests.* · 🔄 1 in background: Run the full test matrix$/)
   })
   test('the count sits in front of a checklist line too', () => {
     const s = startBg(startBg(six(), { id: 'a', toolUseId: '', kind: 'agent', label: 'A' }, NOW), { id: 'b', toolUseId: '', kind: 'monitor', label: 'B' }, NOW)
-    expect(bandLine(s, NOW).startsWith('🔄 2 in background · 🧬 46% ▰▰▰▰▰▱▱▱▱▱')).toBe(true)
+    expect(bandLine(s, NOW).startsWith('📊 46% overall')).toBe(true)
+    expect(bandLine(s, NOW).endsWith('🔄 2 in background')).toBe(true)
   })
   test('finished ones move to the done list for 10 minutes, then go', () => {
     const s = endBg(shell(), { id: 'b1' }, 'completed', NOW - 5 * MIN)
@@ -329,7 +341,7 @@ describe('background tasks', () => {
   })
   test('turn over with one running is Waiting, never Finished; the last end finishes', () => {
     const over = shell({ finished: { at: NOW - 20 * MIN, verdict: 'turn ended', ok: true } })
-    expect(bandLine(over, NOW)).toBe('⏳ Waiting on 1 background task · running for 23 min')
+    expect(bandLine(over, NOW)).toBe('⏳ Waiting on 1 background task · 🔄 Run the full test matrix')
     expect(waitLine(startBg(over, { id: 'b2', toolUseId: '', kind: 'agent', label: 'x' }, NOW), NOW)).toContain('Waiting on 2 background tasks')
     const ended = endBg(over, { id: 'b1' }, 'completed', NOW)
     expect(waitLine(ended, NOW)).toBeNull()
@@ -373,24 +385,26 @@ describe('a checklist is always shown, and the time left when the start is unkno
     expect(line).not.toContain('time left not known yet')
   })
   test('unknown start, no EXPECT, nothing watched: no time-left phrase at all', () => {
-    expect(bandLine(planned(), NOW)).toBe('🧬 46% ▰▰▰▰▰▱▱▱▱▱ · Phase 2: api server · mutant 30/40')
+    expect(bandLine(planned(), NOW)).toBe('📊 46% overall · ▶ Phase 2: api server · mutant 30/40')
   })
   test('unknown start with EXPECT: "at most", from the at-least elapsed', () => {
-    expect(bandLine(planned({ expect_h: 1 }), NOW)).toContain('at most 34 min left (from the estimate)')
+    expect(bandLine(planned({ expect_h: 1 }), NOW)).toContain('⏱ at most 34 min left')
+    expect(cardOf(planned({ expect_h: 1 }), NOW).left).toBe('at most 34 min left (from the estimate)')
   })
   test('watched under 10 minutes: not yet a speed', () => {
     const s = planned({ watch: { at: NOW - 9 * MIN, frac: 0.2 } })
-    expect(bandLine(s, NOW)).not.toContain('from the last')
+    expect(cardOf(s, NOW).left).not.toContain('from the last')
   })
   test('watched 12 min and the % moved from 20% to ~46%: about N min left from the last 12 min', () => {
     const s = planned({ watch: { at: NOW - 12 * MIN, frac: 0.2 } })
     const frac = 2.75 / 6
     const left = ((1 - frac) / ((frac - 0.2) / 12))
-    expect(bandLine(s, NOW)).toContain(`about ${Math.round(left)} min left (from the last 12 min)`)
+    expect(bandLine(s, NOW)).toContain(`⏱ about ${Math.round(left)} min left`)
+    expect(cardOf(s, NOW).left).toContain(`about ${Math.round(left)} min left (from the last 12 min)`)
   })
   test('watched 15 min but the % has not moved: no speed', () => {
     const s = planned({ watch: { at: NOW - 15 * MIN, frac: 2.75 / 6 } })
-    expect(bandLine(s, NOW)).not.toContain('from the last')
+    expect(cardOf(s, NOW).left).not.toContain('from the last')
   })
   test('the speed is only for an unknown start: a known one keeps elapsed × (100 − %) ÷ %', () => {
     expect(bandLine(six({ watch: { at: NOW - 12 * MIN, frac: 0.2 } }), NOW)).toContain('about 31 min left')
@@ -427,7 +441,8 @@ describe('a checklist is always shown, and the time left when the start is unkno
   test('with 8 background tasks and a checklist the band shows both', () => {
     let s = planned()
     for (let i = 0; i < 8; i++) s = startBg(s, { id: `b${i}`, toolUseId: '', kind: 'shell', label: 'x' }, NOW)
-    expect(bandLine(s, NOW).startsWith('🔄 8 in background · 🧬 46%')).toBe(true)
+    expect(bandLine(s, NOW).startsWith('📊 46% overall')).toBe(true)
+    expect(bandLine(s, NOW).endsWith('🔄 8 in background')).toBe(true)
   })
 })
 
@@ -454,5 +469,213 @@ describe('reading a notification', () => {
   })
   test('an unknown task id is reported as unknown', () => {
     expect(noticeBg(base(), parseNotice(env('<task-id>zz</task-id><status>completed</status>'))!, NOW).isKnown).toBe(false)
+  })
+})
+
+describe('0.5.0: reading the run\'s own status line', () => {
+  const at = (h: number, m: number) => new Date(2026, 9, 28, h, m, 0, 0).getTime()
+  test('every time-left form is read', () => {
+    expect(parseLeft('56% · ~288 min left', NOW)).toBe(288)
+    expect(parseLeft('288 min left', NOW)).toBe(288)
+    expect(parseLeft('about 288 min left', NOW)).toBe(288)
+    expect(parseLeft('4 h 48 min left', NOW)).toBe(288)
+    expect(parseLeft('4h48m left', NOW)).toBe(288)
+    expect(parseLeft('2 h left', NOW)).toBe(120)
+    expect(parseLeft('nothing here', NOW)).toBeNull()
+  })
+  test('ETA 17:45 becomes minutes from now, the next time it is that', () => {
+    expect(parseLeft('ETA 17:45', at(15, 0))).toBe(165)
+    expect(parseLeft('ETA 09:00', at(15, 0))).toBe(18 * 60)
+  })
+  test('a status line gives its % and end time; an ordinary line with a % is not one', () => {
+    const r = parseReport('12:51 · P5 waiting · 56% · ~288 min left', NOW)
+    expect(r).toEqual({ at: NOW, pct: 56, eta_at: NOW + 288 * MIN })
+    expect(parseReport('12:51 · P5 waiting · 56%', NOW)?.pct).toBe(56)
+    expect(parseReport('coverage went up 3% today', NOW)).toBeNull()
+    expect(parseReport('first\n10% · 20 min left\nlater\n40% · 9 min left', NOW)?.pct).toBe(40)
+  })
+  test('the run\'s end time is used while the line is under 15 minutes old, then the estimate', () => {
+    const s = six({ report: { at: NOW - 2 * MIN, pct: null, eta_at: NOW - 2 * MIN + 288 * MIN }, expect_h: 4 })
+    expect(Math.round((progressOf(s, NOW).left) ?? -1)).toBe(286)
+    expect(cardOf(s, NOW).left).toBe('about 4 h 46 min left (from the run)')
+    expect(bandLine(s, NOW)).toContain('⏱ about 4 h 46 min left')
+    const old = six({ report: { at: NOW - 16 * MIN, pct: null, eta_at: NOW + 100 * MIN }, expect_h: 4, started_at: NOW - 50 * MIN })
+    expect(cardOf(old, NOW).left).not.toContain('from the run')
+  })
+  test('the newer of the checklist and the status line gives the %', () => {
+    const newerLine = six({ tasks_at: NOW - 5 * MIN, report: { at: NOW - MIN, pct: 56, eta_at: null } })
+    expect(progressOf(newerLine, NOW).pct).toBe(56)
+    const newerList = six({ tasks_at: NOW, report: { at: NOW - MIN, pct: 56, eta_at: null } })
+    expect(progressOf(newerList, NOW).pct).toBe(46)
+  })
+  test('a status line in the run\'s text lands in the status', () => {
+    const s = applyParsed(base(), parseText('12:51 · P5 waiting · 56% · ~288 min left', NOW), NOW)
+    expect(s.report).toEqual({ at: NOW, pct: 56, eta_at: NOW + 288 * MIN })
+  })
+})
+
+describe('0.5.0: background progress', () => {
+  const two = (a: Partial<Bg>, b: Partial<Bg>, over: Partial<Status> = {}): Status => {
+    let s = startBg(startBg(base(over), { id: 'x1', toolUseId: '', kind: 'shell', label: 'Alpha' }, NOW - 20 * MIN), { id: 'x2', toolUseId: '', kind: 'agent', label: 'Beta' }, NOW - 10 * MIN)
+    s = { ...s, bg: s.bg.map(t => (t.id === 'x1' ? { ...t, ...a } : { ...t, ...b })) }
+
+    return s
+  }
+  test('the output\'s last lines give a % and an end time; nothing of the text comes back', () => {
+    const out = scanProgress('compiling secret-token-abc\n▶ step 3/4\nbuilding 40% done\n12 min left\n', NOW)
+    expect(out).toEqual({ pct: 40, eta_at: NOW + 12 * MIN })
+    expect(scanProgress('▶ step 1/2\n▶ step 2/2\n', NOW).pct).toBe(100)
+    expect(scanProgress('nothing\n', NOW)).toEqual({ pct: null, eta_at: null })
+    expect(JSON.stringify(scanProgress('password=hunter2 ▶ x 1/2', NOW))).not.toContain('hunter2')
+  })
+  test('an agent\'s output file is JSON lines: escaped line breaks are read as lines', () => {
+    expect(scanProgress('{"text":"a\\n▶ page 3/6\\nb"}', NOW).pct).toBe(50)
+  })
+  test('setBgProgress keeps what was known and never touches an ended task', () => {
+    const s = two({}, {})
+    const a = setBgProgress(s, 'x1', { pct: 30, eta_at: null }, NOW)
+    expect(a.bg[0]?.pct).toBe(30)
+    expect(setBgProgress(a, 'x1', { pct: null, eta_at: NOW + 5 * MIN }, NOW).bg[0]).toMatchObject({ pct: 30, eta_at: NOW + 5 * MIN })
+    const done = endBg(a, { id: 'x1' }, 'completed', NOW)
+    expect(setBgProgress(done, 'x1', { pct: 90, eta_at: null }, NOW).bg[0]?.pct).toBe(30)
+  })
+  test('a task\'s time left: its own line first, else its pace after 2 minutes, else none', () => {
+    const s = two({ pct: 50, eta_at: NOW + 7 * MIN }, { pct: 25 })
+    expect(bgLeft(s.bg[0] as Bg, NOW)).toEqual({ min: 7, source: 'own' })
+    // 10 minutes in at 25%: 10 × 75 / 25 = 30
+    expect(bgLeft(s.bg[1] as Bg, NOW)).toEqual({ min: 30, source: 'pace' })
+    expect(bgLeft({ ...(s.bg[1] as Bg), pct: null }, NOW)).toBeNull()
+    expect(bgLeft({ ...(s.bg[1] as Bg), started_at: NOW - MIN }, NOW)).toBeNull()
+  })
+  test('the panel row: icon, name, %, running for, time left; or "no % reported"', () => {
+    const s = two({ pct: 40, eta_at: NOW + 12 * MIN }, {})
+    expect(bgLines(s, NOW).running).toEqual([
+      '⌨️ Alpha · 40% ▰▰▰▱▱▱▱▱ · running for 20 min · about 12 min left (from its own line)',
+      '🤖 Beta · no % reported · running for 10 min',
+    ])
+  })
+  test('the band: one task shows its name; several show their % and time, cut after three', () => {
+    const one = startBg(six(), { id: 'w', toolUseId: '', kind: 'shell', label: 'Watch sibling summaries' }, NOW - 5 * MIN)
+    const withPct = { ...one, bg: one.bg.map(b => ({ ...b, pct: 40, eta_at: NOW + 12 * MIN })) }
+    expect(bandLine(withPct, NOW)).toBe('📊 46% overall · ⏱ about 31 min left · ▶ Phase 2: api server · mutant 30/40 · 🔄 1 in background: Watch sibling summaries 40%, ~12 min')
+    const three = two({ pct: 40, eta_at: NOW + 12 * MIN }, { pct: 75, eta_at: NOW + 3 * MIN }, { tasks: [] })
+    expect(bgBand(three, NOW)).toBe('🔄 2 in background (2 with %): 40% ~12 min, 75% ~3 min')
+    let many = three
+    for (const i of [3, 4, 5]) many = startBg(many, { id: `m${i}`, toolUseId: '', kind: 'shell', label: `M${i}` }, NOW - 5 * MIN)
+    many = { ...many, bg: many.bg.map(b => (b.id.startsWith('m') ? { ...b, pct: 10, eta_at: NOW + 60 * MIN } : b)) }
+    expect(bgBand(many, NOW)).toBe('🔄 5 in background (5 with %): 40% ~12 min, 75% ~3 min, 10% ~1 h, …')
+  })
+})
+
+describe('0.5.0: overall', () => {
+  const withBg = (over: Partial<Status>, bgs: Array<Partial<Bg>>): Status => {
+    let s = base(over)
+    bgs.forEach((b, i) => {
+      s = startBg(s, { id: `t${i}`, toolUseId: '', kind: 'shell', label: `T${i}` }, NOW - 10 * MIN)
+      s = { ...s, bg: s.bg.map(x => (x.id === `t${i}` ? { ...x, ...b } : x)) }
+    })
+
+    return s
+  }
+  const main = (left: number): Partial<Status> => ({ report: { at: NOW, pct: null, eta_at: NOW + left * MIN }, tasks: six().tasks })
+  test('time left overall is the longest of the main run and every running task', () => {
+    const s = withBg(main(30), [{ eta_at: NOW + 90 * MIN }, { eta_at: NOW + 20 * MIN }])
+    expect(Math.round((overallOf(s, NOW).left) ?? -1)).toBe(90)
+    const longMain = withBg(main(288), [{ eta_at: NOW + 20 * MIN }])
+    expect(Math.round((overallOf(longMain, NOW).left) ?? -1)).toBe(288)
+    expect(overallLeftText(overallOf(longMain, NOW))).toBe('about 4 h 48 min left overall')
+  })
+  test('a running task with no estimate is said so', () => {
+    const s = withBg(main(288), [{ eta_at: NOW + 20 * MIN }, {}])
+    expect(overallLeftText(overallOf(s, NOW))).toBe('about 4 h 48 min left overall (1 background task with no estimate)')
+    expect(bandLine(s, NOW)).toContain('⏱ about 4 h 48 min left (1 background task with no estimate)')
+  })
+  test('while the main run works its % is the overall %; never 100 while anything runs', () => {
+    const s = withBg({ tasks: [task(1, 'completed')] }, [{}])
+    expect(progressOf(s, NOW).pct).toBe(100)
+    expect(overallOf(s, NOW).pct).toBe(99)
+    expect(overallOf(base({ tasks: [task(1, 'completed')] }), NOW).pct).toBe(100)
+    expect(overallOf(withBg({ tasks: six().tasks }, [{ pct: 90 }]), NOW).pct).toBe(46)
+  })
+  test('once the main run is over the overall % is the average of the tasks that report one', () => {
+    const over = { finished: { at: NOW - MIN, verdict: 'turn ended', ok: true } }
+    const s = withBg(over, [{ pct: 40 }, { pct: 75 }, {}])
+    expect(overallOf(s, NOW).pct).toBe(58)
+    expect(overallOf(withBg(over, [{}]), NOW).pct).toBeNull()
+    expect(overallOf(withBg(over, [{ pct: 100 }]), NOW).pct).toBe(99)
+    expect(bandLine(s, NOW)).toMatch(/^⏳ Waiting on 3 background tasks · 📊 58% overall/)
+  })
+  test('the card carries the overall block and the main run\'s own time left', () => {
+    const c = cardOf(withBg(main(288), [{ eta_at: NOW + 20 * MIN }]), NOW)
+    expect(c.overall.left).toBe('about 4 h 48 min left overall')
+    expect(c.overall.pct).toBe(46)
+    expect(c.mainLeft).toBe('about 4 h 48 min left (from the run)')
+  })
+})
+
+describe('0.5.0: what the transcript says', () => {
+  // `grep -noE` over this session's transcript: `row:match`. Shapes copied from a real session; the text of every row is gone.
+  const grep = [
+    '97:"timestamp":"2026-10-28T07:37:00.100Z"',
+    '97:"backgroundTaskId":"bsh1"',
+    '98:"timestamp":"2026-10-28T07:37:01.200Z"',
+    '98:"status":"async_launched","agentId":"aag1"',
+    '128:"timestamp":"2026-10-28T07:39:30.000Z"',
+    '128:<task-id>aag1</task-id>',
+    '128:<status>completed</status>',
+    '133:"timestamp":"2026-10-28T07:39:31.000Z"',
+    '133:<task-id>aag1</task-id>',
+    '133:<status>completed</status>',
+    '138:<task-id>aag1</task-id>',
+    '138:<status>completed</status>',
+    '152:"timestamp":"2026-10-28T07:41:50.500Z"',
+    '152:<task-id>bsh1</task-id>',
+    '152:<status>completed</status>',
+    '160:<task-id>zz</task-id>',
+    '160:<status>running</status>',
+    '170:"customTitle":"GQ3B form losing areas"',
+    '175:"customTitle":"GQ3B form \\"losing\\" areas"',
+  ].join('\n')
+  test('starts, ends, times and the name are read; blob rows without a time and non-end statuses are ignored', () => {
+    const h = parseHist(grep)
+    expect(h.starts).toEqual({ bsh1: Date.parse('2026-10-28T07:37:00.100Z'), aag1: Date.parse('2026-10-28T07:37:01.200Z') })
+    expect(h.ends).toEqual({ aag1: { at: Date.parse('2026-10-28T07:39:30.000Z'), status: 'completed' }, bsh1: { at: Date.parse('2026-10-28T07:41:50.500Z'), status: 'completed' } })
+    expect(h.title).toBe('GQ3B form "losing" areas')
+  })
+  test('each task gets its own start, and an end the live hook missed', () => {
+    const h = parseHist(grep)
+    let s = startBg(startBg(base(), { id: 'bsh1', toolUseId: '', kind: 'shell', label: 'Sample' }, NOW), { id: 'aag1', toolUseId: '', kind: 'agent', label: 'Agent' }, NOW)
+    s = startBg(s, { id: 'still', toolUseId: '', kind: 'shell', label: 'Still' }, NOW)
+    const out = applyHist(s, h)
+    expect(out.bg.find(b => b.id === 'bsh1')).toMatchObject({ started_at: Date.parse('2026-10-28T07:37:00.100Z'), ended_at: Date.parse('2026-10-28T07:41:50.500Z'), ok: true, end: 'completed', seen: 'completed' })
+    expect(out.bg.find(b => b.id === 'still')).toMatchObject({ started_at: NOW, ended_at: null })
+    expect(out.title).toBe('GQ3B form "losing" areas')
+    expect(titleOf(out)).toBe('GQ3B form "losing" areas')
+  })
+  test('a reload: the task starts at its own time, not at the reload; one that ended long ago is gone, a recent end is kept', () => {
+    const t0 = Date.parse('2026-10-28T07:37:00.100Z')
+    const rows = [
+      { role: 'user', text: 'go' },
+      { role: 'assistant', text: '', toolUses: [{ tool: 'Bash', tool_use_id: 'tu1', input: { description: 'Sample', run_in_background: true }, result: { backgroundTaskId: 'bsh1' } }] },
+      { role: 'assistant', text: '', toolUses: [{ tool: 'Bash', tool_use_id: 'tu2', input: { description: 'Other', run_in_background: true }, result: { backgroundTaskId: 'bsh2' } }] },
+    ]
+    const h = parseHist(`${grep}\n200:"timestamp":"2026-10-28T07:00:00.000Z"\n200:"backgroundTaskId":"bsh2"`)
+    const recent = recover(base(), rows, t0 + 5 * MIN, h)
+    expect(recent.bg.map(b => [b.id, b.started_at < t0 + MIN, b.ended_at !== null])).toEqual([['bsh1', true, true], ['bsh2', true, false]])
+    expect(bgDone(recent, t0 + 5 * MIN).map(b => b.id)).toEqual(['bsh1'])
+    const later = recover(base(), rows, t0 + 60 * MIN, h)
+    expect(later.bg.map(b => b.id)).toEqual(['bsh2'])
+    expect(later.bg[0]?.started_at).toBe(Date.parse('2026-10-28T07:00:00.000Z'))
+  })
+  test('/builds-tasks shows the matched end', () => {
+    const s = applyHist(startBg(base(), { id: 'bsh1', toolUseId: '', kind: 'shell', label: 'Sample' }, NOW), parseHist(grep))
+    expect(bgReport(s, [], NOW)).toMatch(/ended \d\d:\d\d \(completed\) · last notice: bsh1 completed/)
+  })
+  test('the status file keeps the new fields', () => {
+    const s = { ...startBg(base(), { id: 'a', toolUseId: '', kind: 'shell', label: 'A' }, NOW), report: { at: NOW, pct: 5, eta_at: NOW + MIN }, title: 'T' }
+    const back = normalize(JSON.parse(JSON.stringify({ ...s, bg: s.bg.map(b => ({ ...b, pct: 20, eta_at: NOW + MIN, prog_at: NOW })) })))
+    expect(back?.title).toBe('T')
+    expect(back?.report).toEqual({ at: NOW, pct: 5, eta_at: NOW + MIN })
+    expect(back?.bg[0]).toMatchObject({ pct: 20, eta_at: NOW + MIN })
   })
 })

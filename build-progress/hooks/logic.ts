@@ -1,4 +1,4 @@
-import type { Bg, Finish, Marker, Status, Step, Task } from '../types'
+import type { Bg, Finish, Marker, Report, Status, Step, Task } from '../types'
 
 export const QUIET_MS = 10 * 60_000
 export const STALE_TOOL_MS = 15 * 60_000
@@ -12,6 +12,10 @@ export const BG_DONE_MS = 10 * 60_000
 export const BG_CAP_MS = 2 * 3_600_000
 export const BG_KEEP = 20
 export const STEPS_KEPT = 5
+/** A status line the run printed is trusted for this long. */
+export const REPORT_MS = 15 * 60_000
+/** A background task's own pace is read after this long. */
+export const BG_PACE_MIN = 2
 
 export type RunState = 'building' | 'testing' | 'mutation' | 'quiet' | 'done' | 'failed'
 
@@ -88,6 +92,9 @@ export const blankStatus = (session: string, folder: string, branch: string, now
   steps: 0,
   recent: [],
   watch: null,
+  report: null,
+  tasks_at: now,
+  title: '',
 })
 
 /** A background task that has not ended and is within the 2-hour cap. */
@@ -108,7 +115,7 @@ export type BgStart = { id: string; toolUseId: string; kind: Bg['kind']; label: 
 /** A background task begins (or is seen again under a better id). */
 export const startBg = (s: Status, b: BgStart, now: number): Status => {
   const old = s.bg.find(x => x.id === b.id || (b.toolUseId !== '' && x.tool_use_id === b.toolUseId))
-  const made: Bg = { id: b.id, tool_use_id: b.toolUseId, kind: b.kind, label: b.label, started_at: old?.started_at ?? now, ended_at: null, ok: null, end: null, seen: old?.seen ?? null }
+  const made: Bg = { id: b.id, tool_use_id: b.toolUseId, kind: b.kind, label: b.label, started_at: old?.started_at ?? now, ended_at: null, ok: null, end: null, seen: old?.seen ?? null, pct: old?.pct ?? null, eta_at: old?.eta_at ?? null, prog_at: old?.prog_at ?? null }
 
   return { ...s, bg: pruneBg([...s.bg.filter(x => x !== old), made], now) }
 }
@@ -188,11 +195,73 @@ const END = /^\s*▶\s*(done|finished|failed|stopped)\b[\s:—–-]*(.*)$/i
 export type Parsed = {
   markers: Marker[]
   finished: Finish | null
+  report: Report | null
+}
+
+/** Minutes left named by one line: `~288 min left`, `about 288 min left`, `4 h 48 min left`, `4h48m left`, `ETA 17:45` (local time, the next time it is that). Null when the line names none. */
+export const parseLeft = (line: string, now: number): number | null => {
+  const hm = /(\d+)\s*h(?:ours?|rs?)?\s*(?:(\d+)\s*m(?:in(?:ute)?s?)?)?\s*left\b/i.exec(line)
+  if (hm) return Number(hm[1]) * 60 + Number(hm[2] ?? 0)
+  const m = /(\d+(?:\.\d+)?)\s*min(?:ute)?s?\s*left\b/i.exec(line)
+  if (m) return Math.round(Number(m[1]))
+  const eta = /\bETA\s*(\d{1,2}):(\d{2})\b/i.exec(line)
+  if (eta) {
+    const at = new Date(now)
+    at.setHours(Number(eta[1]), Number(eta[2]), 0, 0)
+    let diff = at.getTime() - now
+    if (diff < -5 * 60_000) diff += 24 * 3_600_000
+
+    return Math.max(0, Math.round(diff / 60_000))
+  }
+  return null
+}
+
+const STAMPED = /^\s*\d{1,2}:\d{2}\s*[·|•-]\s.*\b\d{1,3}\s*%/
+const PCT = /(?:^|[^\w.])(\d{1,3})\s*%/
+
+/** The run's own newest status line: one that names a time left, or starts with a clock time and carries a %. Only the % and the end time are kept. */
+export const parseReport = (text: string, now: number): Report | null => {
+  let out: Report | null = null
+  for (const line of text.split('\n')) {
+    const left = parseLeft(line, now)
+    if (left === null && !STAMPED.test(line)) continue
+    const p = PCT.exec(line)
+    const pct = p && Number(p[1]) <= 100 ? Number(p[1]) : null
+    out = { at: now, pct, eta_at: left === null ? null : now + left * 60_000 }
+  }
+  return out
+}
+
+/** A background task's progress from the last lines of its output: the newest `▶ x n/N` or `NN%`, and the newest time-left line. Nothing of the text is kept. */
+export const scanProgress = (raw: string, now: number): { pct: number | null; eta_at: number | null } => {
+  let pct: number | null = null
+  let eta: number | null = null
+  for (const line of raw.replace(/\\n/g, '\n').split('\n')) {
+    const m = /▶\s*[A-Za-z][\w-]*\s+(\d+)\s*\/\s*(\d+)/.exec(line)
+    if (m && Number(m[2]) > 0) pct = Math.min(100, Math.max(0, Math.round((Number(m[1]) / Number(m[2])) * 100)))
+    else {
+      const p = PCT.exec(line)
+      if (p && Number(p[1]) <= 100) pct = Number(p[1])
+    }
+    const left = parseLeft(line, now)
+    if (left !== null) eta = now + left * 60_000
+  }
+  return { pct, eta_at: eta }
+}
+
+/** The share of a checklist done (items done + the open item's own n/N), or null for an empty one. */
+export const listFraction = (tasks: readonly Task[]): number | null => {
+  if (tasks.length === 0) return null
+  const done = tasks.filter(t => t.status === 'completed').length
+  const mark = tasks.find(t => t.status === 'in_progress')?.mark
+  const own = mark && mark.N > 0 ? Math.min(1, Math.max(0, mark.n / mark.N)) : 0
+
+  return Math.min(1, (done + own) / tasks.length)
 }
 
 /** Reads `▶ kind n/N` markers and `▶ done` / `▶ failed`. */
 export const parseText = (text: string, now: number): Parsed => {
-  const out: Parsed = { markers: [], finished: null }
+  const out: Parsed = { markers: [], finished: null, report: parseReport(text, now) }
   for (const raw of text.split('\n')) {
     const end = END.exec(raw)
     if (end) {
@@ -236,6 +305,8 @@ export const applyParsed = (s: Status, p: Parsed, now: number = s.updated_at): S
       tasks,
       markers: [...s.markers, ...p.markers].slice(-10),
       finished: p.finished ?? s.finished,
+      report: p.report ?? s.report,
+      tasks_at: p.markers.length > 0 ? now : s.tasks_at,
     },
     now,
   )
@@ -431,6 +502,7 @@ export const folderName = (folder: string, labels: Array<[string, string]> = fol
 
 /** The prompt id; with none, the folder and branch. Never a session id. */
 export const titleOf = (s: Status): string => {
+  if (s.title) return s.title
   const f = folderName(s.folder)
   const id = cleanId(s.prompt_id)
   if (id !== '—') return id
@@ -448,14 +520,16 @@ export type Progress = {
   /** True when the start is only a lower bound, so `elapsed` is a minimum. */
   isAtLeast: boolean
   /** Where `left` comes from when the start is unknown: the speed seen since the mod loaded, or an upper bound from EXPECT. */
-  basis?: { kind: 'speed'; watched: number } | { kind: 'atmost' }
+  basis?: { kind: 'speed'; watched: number } | { kind: 'atmost' } | { kind: 'pace' }
+  /** True when `left` is the run's own status line. */
+  isFromRun?: boolean
 }
 
 export const WATCH_MIN = 10
 
 /** The baseline for the speed: the first share seen since the mod loaded; rebased if the share falls (the list grew). */
 export const watchOf = (s: Status, now: number): Status => {
-  const f = fractionOf(s)
+  const f = shareOf(s)
   if (f === null) return s.watch === null ? s : { ...s, watch: null }
   if (s.watch === null || f < s.watch.frac) return { ...s, watch: { at: now, frac: f } }
 
@@ -464,12 +538,7 @@ export const watchOf = (s: Status, now: number): Status => {
 
 /** The share of the whole prompt done: from the to-do list (items done + the open item's own n/N), else the ▶ phase markers. */
 export const fractionOf = (s: Status): number | null => {
-  if (s.tasks.length > 0) {
-    const done = s.tasks.filter(t => t.status === 'completed').length
-    const mark = s.tasks.find(t => t.status === 'in_progress')?.mark
-    const own = mark && mark.N > 0 ? Math.min(1, Math.max(0, mark.n / mark.N)) : 0
-    return Math.min(1, (done + own) / s.tasks.length)
-  }
+  if (s.tasks.length > 0) return listFraction(s.tasks)
   if (s.phase && s.phase.N > 0) {
     const own = s.other && s.other.N > 0 ? Math.min(1, Math.max(0, s.other.n / s.other.N)) : 0
     return Math.min(1, Math.max(0, (s.phase.n - 1 + own) / s.phase.N))
@@ -477,12 +546,24 @@ export const fractionOf = (s: Status): number | null => {
   return null
 }
 
-/** % and time left. Under 10%: EXPECT minus elapsed (not below 5 min); from 10%: elapsed × (100 − %) ÷ %. */
+/** The run's share done: the run's own newest status line when it is newer than the last change of the checklist, else the checklist and markers. */
+export const shareOf = (s: Status): number | null => {
+  const r = s.report
+  if (r && r.pct !== null && r.at >= s.tasks_at) return Math.min(1, r.pct / 100)
+
+  return fractionOf(s)
+}
+
+/** % and time left. From the run's own status line (under 15 minutes old); else under 10%: EXPECT minus elapsed (not below 5 min); from 10%: elapsed × (100 − %) ÷ %. */
 export const progressOf = (s: Status, now: number): Progress => {
-  const frac = s.finished?.ok ? 1 : fractionOf(s)
+  const frac = s.finished?.ok ? 1 : shareOf(s)
   const pct = frac === null ? null : Math.round(frac * 100)
   const elapsed = Math.max(0, (now - s.started_at) / 60_000)
   const isAtLeast = !s.start_known
+  const r = s.report
+  if (!s.finished && r && r.eta_at !== null && now - r.at <= REPORT_MS) {
+    return { pct, left: Math.max(0, (r.eta_at - now) / 60_000), isFromEstimate: false, elapsed, isAtLeast, isFromRun: true }
+  }
   if (isAtLeast) {
     // the start is a lower bound: time left comes from the speed seen since the mod loaded (≥ 10 min watched and the % moved), else an upper bound from EXPECT, else nothing
     const w = s.watch
@@ -495,7 +576,7 @@ export const progressOf = (s: Status, now: number): Progress => {
 
     return { pct, left: null, isFromEstimate: false, elapsed, isAtLeast }
   }
-  if (pct !== null && pct >= EARLY_PCT) return { pct, left: (elapsed * (100 - pct)) / pct, isFromEstimate: false, elapsed, isAtLeast }
+  if (pct !== null && pct >= EARLY_PCT) return { pct, left: (elapsed * (100 - pct)) / pct, isFromEstimate: false, elapsed, isAtLeast, basis: { kind: 'pace' } }
   if (s.expect_h !== null) return { pct, left: Math.max(MIN_LEFT, s.expect_h * 60 - elapsed), isFromEstimate: true, elapsed, isAtLeast }
   return { pct, left: null, isFromEstimate: false, elapsed, isAtLeast }
 }
@@ -512,6 +593,8 @@ export const isPlain = (s: Status, now: number): boolean => {
 
 export const leftText = (p: Progress): string => {
   if (p.left === null) return p.isAtLeast ? '' : 'time left not known yet'
+  if (p.isFromRun) return `about ${fmtMin(p.left)} left (from the run)`
+  if (p.basis?.kind === 'pace') return `about ${fmtMin(p.left)} left (from the pace so far)`
   if (p.basis?.kind === 'speed') return `about ${fmtMin(p.left)} left (from the last ${fmtMin(p.basis.watched)})`
   if (p.basis?.kind === 'atmost') return `at most ${fmtMin(p.left)} left (from the estimate)`
 
@@ -554,6 +637,74 @@ export const doingWords = (s: Status): string => {
   return 'Thinking'
 }
 
+/** A background task's progress read from its output or checklist; unknown parts keep what was known. */
+export const setBgProgress = (s: Status, id: string, p: { pct: number | null; eta_at: number | null }, now: number): Status => {
+  if (p.pct === null && p.eta_at === null) return s
+
+  return { ...s, bg: s.bg.map(b => (b.ended_at === null && (b.id === id || b.tool_use_id === id) ? { ...b, pct: p.pct ?? b.pct, eta_at: p.eta_at ?? b.eta_at, prog_at: now } : b)) }
+}
+
+/** Minutes left for one background task: its own end time while it has not long passed, else its pace (after 2 minutes, from its %). */
+export const bgLeft = (b: Bg, now: number): { min: number; source: 'own' | 'pace' } | null => {
+  if (b.eta_at !== null && b.eta_at - now > -5 * 60_000) return { min: Math.max(0, (b.eta_at - now) / 60_000), source: 'own' }
+  const elapsed = (now - b.started_at) / 60_000
+  if (b.pct !== null && b.pct > 0 && b.pct < 100 && elapsed >= BG_PACE_MIN) return { min: (elapsed * (100 - b.pct)) / b.pct, source: 'pace' }
+
+  return null
+}
+
+export type Overall = {
+  /** Never 100 while anything runs. */
+  pct: number | null
+  left: number | null
+  /** Running background tasks with no time left known. */
+  noEstimate: number
+}
+
+/** The whole session: % of the main run while it works (the average of the background tasks that report one once it is over); time left is the longest of the main run's and every running task's. */
+export const overallOf = (s: Status, now: number): Overall => {
+  const run = bgRunning(s, now)
+  const p = progressOf(s, now)
+  const isMainOpen = !s.finished
+  const lefts = run.map(b => bgLeft(b, now)?.min ?? null)
+  const known = lefts.filter((x): x is number => x !== null)
+  const noEstimate = lefts.length - known.length
+  let left: number | null = null
+  if (isMainOpen) left = p.left === null ? null : Math.max(p.left, ...known)
+  else if (known.length > 0) left = Math.max(...known)
+  let pct: number | null
+  if (run.length === 0) pct = p.pct
+  else if (isMainOpen) pct = p.pct === null ? null : Math.min(99, p.pct)
+  else {
+    const reported = run.flatMap(b => (b.pct === null ? [] : [b.pct]))
+    pct = reported.length === 0 ? null : Math.min(99, Math.round(reported.reduce((a, c) => a + c, 0) / reported.length))
+  }
+  return { pct, left, noEstimate }
+}
+
+/** `about 4 h 48 min left overall (1 background task with no estimate)`, or '' when not known. */
+export const overallLeftText = (o: Overall): string =>
+  o.left === null ? '' : `about ${fmtMin(o.left)} left overall${o.noEstimate > 0 ? ` (${o.noEstimate} background task${o.noEstimate === 1 ? '' : 's'} with no estimate)` : ''}`
+
+const bgBits = (b: Bg, now: number): string[] => {
+  const l = bgLeft(b, now)
+
+  return [b.pct === null ? '' : `${b.pct}%`, l ? `~${fmtMin(l.min)}` : ''].filter(Boolean)
+}
+
+/** The band's background part: `🔄 1 in background: Watch 40%, ~12 min`, or `🔄 3 in background (2 with %): 40% ~12 min, 75% ~3 min, …`. */
+export const bgBand = (s: Status, now: number): string => {
+  const run = bgRunning(s, now)
+  if (run.length === 0) return ''
+  const first = run[0]
+  if (run.length === 1 && first) return `🔄 1 in background: ${[first.label, bgBits(first, now).join(', ')].filter(Boolean).join(' ')}`
+  const withPct = run.filter(b => b.pct !== null).length
+  const entries = run.map(b => bgBits(b, now).join(' ')).filter(Boolean)
+  const shown = entries.slice(0, 3).join(', ') + (entries.length > 3 ? ', …' : '')
+
+  return `🔄 ${run.length} in background${withPct > 0 ? ` (${withPct} with %)` : ''}${shown ? `: ${shown}` : ''}`
+}
+
 const quietMin = (s: Status, now: number): number => Math.floor((now - s.updated_at) / 60_000)
 
 /** `⏳ Waiting on 1 background task · running for 23 min` while the turn is over and a background task runs, else null. */
@@ -582,24 +733,36 @@ const endLine = (s: Status, p: Progress, now: number): string | null => {
 
 /** The band above the prompt, one line. */
 export const bandLine = (s: Status, now: number): string => {
+  const o = overallOf(s, now)
+  const pctPart = o.pct === null ? '' : `📊 ${o.pct}% overall`
+  const leftPart = o.left === null ? '' : `⏱ ${progressOf(s, now).basis?.kind === 'atmost' && o.noEstimate === 0 ? 'at most' : 'about'} ${fmtMin(o.left)} left${o.noEstimate > 0 ? ` (${o.noEstimate} background task${o.noEstimate === 1 ? '' : 's'} with no estimate)` : ''}`
+  const back = bgBand(s, now)
   const wait = waitLine(s, now)
-  if (wait) return wait
+  if (wait) return [`⏳ Waiting on ${bgRunning(s, now).length} background task${bgRunning(s, now).length === 1 ? '' : 's'}`, pctPart, leftPart, back.replace(/^🔄 \d+ in background(?: \(\d+ with %\))?:? ?/, '🔄 ')].filter(x => x !== '🔄 ' && x !== '').join(' · ')
   const p = progressOf(s, now)
   const end = endLine(s, p, now)
-  const n = bgRunning(s, now).length
-  const prefix = n > 0 ? `🔄 ${n} in background · ` : ''
-  const bar = p.pct === null ? '' : `${p.pct}% ${barText(p.pct)}`
-  if (end) return s.finished ? end : [end, bar].filter(Boolean).join(' · ')
+  if (end) return s.finished ? end : [end, pctPart].filter(Boolean).join(' · ')
   const emoji = EMOJI[stateOf(s, now)]
-  if (isPlain(s, now)) return `${prefix}${emoji === '😴' ? emoji : '🔨'} Working · Now: ${doingWords(s)} · ${stepsText(s.steps)} so far · ${runningText(p)}`
-  if (p.pct === null) return prefix + [emoji, leftText(p), runningText(p), ...workParts(s, true)].filter(Boolean).join(' · ').replace(`${emoji} · `, `${emoji} `)
-  return prefix + [`${emoji} ${bar}`, leftText(p), ...workParts(s, true)].filter(Boolean).join(' · ')
+  if (isPlain(s, now)) return [`${emoji === '😴' ? emoji : '🔨'} Working · Now: ${doingWords(s)} · ${stepsText(s.steps)} so far · ${runningText(p)}`, back].filter(Boolean).join(' · ')
+  if (p.pct === null) return [[emoji, leftText(p), runningText(p), ...workParts(s, true)].filter(Boolean).join(' · ').replace(`${emoji} · `, `${emoji} `), back].filter(Boolean).join(' · ')
+  const work = workParts(s, true).join(' · ')
+
+  return [pctPart, leftPart, work === '' ? '' : `▶ ${work}`, back].filter(Boolean).join(' · ')
+}
+
+export const KIND_ICON: Record<Bg['kind'], string> = { shell: '⌨️', agent: '🤖', monitor: '👁' }
+
+/** One running task as a row: icon, name, % (or "no % reported"), its own running time, and time left when known. */
+export const bgRowText = (b: Bg, now: number): string => {
+  const l = bgLeft(b, now)
+
+  return [`${KIND_ICON[b.kind]} ${b.label}`, b.pct === null ? 'no % reported' : `${b.pct}% ${barText(b.pct, 8)}`, `running for ${fmtMin((now - b.started_at) / 60_000)}`, l ? `about ${fmtMin(l.min)} left (${l.source === 'own' ? 'from its own line' : 'from its pace'})` : ''].filter(Boolean).join(' · ')
 }
 
 /** The panel's background lists, as plain lines: those running (or without news) and those that ended in the last 10 minutes. */
 export const bgLines = (s: Status, now: number): { running: string[]; done: string[] } => ({
   running: [
-    ...bgRunning(s, now).map(b => `🔄 ${b.label} · running for ${fmtMin((now - b.started_at) / 60_000)}`),
+    ...bgRunning(s, now).map(b => bgRowText(b, now)),
     ...bgStale(s, now).map(b => `❔ ${b.label} · no news for 2 h`),
   ],
   done: bgDone(s, now).map(b => {
@@ -619,6 +782,7 @@ export const cardOf = (s: Status, now: number) => {
   const p = progressOf(s, now)
   const plain = isPlain(s, now)
   const wait = waitLine(s, now)
+  const o = overallOf(s, now)
   const over = st === 'done' || st === 'failed' || wait !== null
 
   return {
@@ -635,6 +799,8 @@ export const cardOf = (s: Status, now: number) => {
     doing: over ? '' : `Now: ${doingWords(s)}`,
     bg: bgLines(s, now),
     steps: stepLines(s),
+    overall: { pct: o.pct, bar: barText(o.pct), left: overallLeftText(o), running: runningText(p) },
+    mainLeft: plain ? '' : leftText(p),
   }
 }
 
@@ -655,10 +821,75 @@ export const visibleRuns = (list: Status[], now: number, showFinished: boolean):
     .filter(s => now - s.updated_at <= HIDE_MS && (showFinished || !s.finished))
     .sort((a, b) => RANK[stateOf(a, now)] - RANK[stateOf(b, now)] || b.updated_at - a.updated_at)
 
+/** What the session's transcript says about its background tasks and its name: ids, status words, clock times. No text. */
+export type Hist = { title: string; starts: Record<string, number>; ends: Record<string, { at: number; status: string }> }
+
+/** The pattern `grep -noE` runs over the transcript: row times, background starts and ends, the session's name. */
+export const HIST_PATTERN = '"timestamp":"[^"]+"|"backgroundTaskId":"[A-Za-z0-9]+"|"status":"async_launched","agentId":"[A-Za-z0-9]+"|<task-id>[^<]+</task-id>|<status>[^<]+</status>|"customTitle":"[^"]*"'
+
+/** Reads `grep -noE` output (`line:match`): a start is a row with a `backgroundTaskId` or an `async_launched` agent; an end is a row with a `<task-id>` and a terminal `<status>`; the first row time of each wins. */
+export const parseHist = (stdout: string): Hist => {
+  const out: Hist = { title: '', starts: {}, ends: {} }
+  const rows = new Map<string, { ts: number | null; starts: string[]; ids: string[]; statuses: string[] }>()
+  for (const raw of stdout.split('\n')) {
+    const i = raw.indexOf(':')
+    if (i < 0) continue
+    const key = raw.slice(0, i)
+    const m = raw.slice(i + 1)
+    const row = rows.get(key) ?? { ts: null, starts: [], ids: [], statuses: [] }
+    rows.set(key, row)
+    const ts = /^"timestamp":"([^"]+)"$/.exec(m)?.[1]
+    const shell = /^"backgroundTaskId":"([A-Za-z0-9]+)"$/.exec(m)?.[1]
+    const agent = /^"status":"async_launched","agentId":"([A-Za-z0-9]+)"$/.exec(m)?.[1]
+    const id = /^<task-id>([^<]+)<\/task-id>$/.exec(m)?.[1]
+    const status = /^<status>([^<]+)<\/status>$/.exec(m)?.[1]
+    const title = /^"customTitle":"(.*)"$/.exec(m)?.[1]
+    if (ts && row.ts === null) {
+      const t = Date.parse(ts)
+      row.ts = Number.isFinite(t) ? t : null
+    } else if (shell || agent) row.starts.push((shell ?? agent) as string)
+    else if (id) row.ids.push(id.trim())
+    else if (status) row.statuses.push(status.trim().toLowerCase())
+    else if (title !== undefined) {
+      try {
+        out.title = scrub(JSON.parse(`"${title}"`) as string, 70)
+      } catch {
+        out.title = scrub(title, 70)
+      }
+    }
+  }
+  for (const row of rows.values()) {
+    if (row.ts === null) continue
+    for (const id of row.starts) out.starts[id] = Math.min(out.starts[id] ?? Infinity, row.ts)
+    const id = row.ids[0]
+    const status = row.statuses[0]
+    if (id && status && TERMINAL.test(status)) {
+      const was = out.ends[id]
+      if (!was || row.ts < was.at) out.ends[id] = { at: row.ts, status }
+    }
+  }
+  return out
+}
+
+/** The transcript's facts laid on the task list: each task's own start, and its end when the transcript has it. */
+export const applyHist = (s: Status, h: Hist): Status => ({
+  ...s,
+  title: h.title || s.title,
+  bg: s.bg.map(b => {
+    const start = h.starts[b.id] ?? h.starts[b.tool_use_id]
+    const o = start === undefined ? b : { ...b, started_at: start }
+    const end = h.ends[b.id] ?? h.ends[b.tool_use_id]
+    if (!end || o.ended_at !== null) return o
+    const word = scrub(end.status, 20).toLowerCase()
+
+    return { ...o, ended_at: end.at, ok: word === 'completed' || word === 'done' || word === 'finished', end: word, seen: word }
+  }),
+})
+
 /** Reads this session's earlier rows once: the first prompt's id, role and EXPECT, the to-do list, the markers. */
 export type Row = { role: string; text?: string; toolUses?: { tool?: string; tool_use_id?: string; input?: unknown; result?: unknown; text?: unknown }[] }
 
-export const recover = (s: Status, rows: readonly Row[], now: number): Status => {
+export const recover = (s: Status, rows: readonly Row[], now: number, hist: Hist | null = null): Status => {
   let out = s
   const first = rows.find(r => r.role === 'user' && typeof r.text === 'string' && r.text.trim() !== '')
   if (first?.text) {
@@ -693,7 +924,8 @@ export const recover = (s: Status, rows: readonly Row[], now: number): Status =>
     }
   }
   // what ended before the reload is not known to the minute: only the running ones are rebuilt (the status file's own earlier copy adds the recent ones)
-  out = { ...out, bg: out.bg.filter(b => b.ended_at === null) }
+  out = hist ? applyHist(out, hist) : out
+  out = { ...out, bg: out.bg.filter(b => b.ended_at === null || (hist !== null && now - b.ended_at <= BG_DONE_MS)) }
   const lastRow = rows[rows.length - 1]
   const open = lastRow?.role === 'assistant' ? lastRow.toolUses?.find(t => t.result === undefined && t.text === undefined && t.tool !== 'Monitor' && (t.input as Record<string, unknown> | undefined)?.run_in_background !== true) : undefined
   // the last row is the assistant's final answer and nothing is open: the turn is over, when it ended is not in the history
@@ -726,6 +958,11 @@ export const normalize = (raw: unknown): Status | null => {
     const o = v as Record<string, unknown> | null
 
     return o && num(o.at) !== null && num(o.frac) !== null ? { at: o.at as number, frac: o.frac as number } : null
+  }
+  const report = (v: unknown): Report | null => {
+    const o = v as Record<string, unknown> | null
+
+    return o && num(o.at) !== null ? { at: o.at as number, pct: num(o.pct), eta_at: num(o.eta_at) } : null
   }
   const phase = pair(r.phase)
   const oth = pair(r.other)
@@ -772,11 +1009,14 @@ export const normalize = (raw: unknown): Status | null => {
     bg: Array.isArray(r.bg)
       ? r.bg.slice(-BG_KEEP).flatMap((b: Record<string, unknown>) =>
           b && num(b.started_at) !== null && (b.kind === 'shell' || b.kind === 'agent' || b.kind === 'monitor')
-            ? [{ id: str(b.id, 64), tool_use_id: str(b.tool_use_id, 64), kind: b.kind, label: str(b.label, 70), started_at: b.started_at as number, ended_at: num(b.ended_at), ok: typeof b.ok === 'boolean' ? b.ok : null, end: typeof b.end === 'string' ? str(b.end, 20) : null, seen: typeof b.seen === 'string' ? str(b.seen, 20) : null }]
+            ? [{ id: str(b.id, 64), tool_use_id: str(b.tool_use_id, 64), kind: b.kind, label: str(b.label, 70), started_at: b.started_at as number, ended_at: num(b.ended_at), ok: typeof b.ok === 'boolean' ? b.ok : null, end: typeof b.end === 'string' ? str(b.end, 20) : null, seen: typeof b.seen === 'string' ? str(b.seen, 20) : null, pct: num(b.pct), eta_at: num(b.eta_at), prog_at: num(b.prog_at) }]
             : [],
         )
       : [],
     watch: pair2(r.watch),
+    report: report(r.report),
+    tasks_at: num(r.tasks_at) ?? (r.updated_at as number),
+    title: str(r.title, 70),
     steps: num(r.steps) ?? 0,
     recent: Array.isArray(r.recent)
       ? r.recent.slice(-STEPS_KEPT).flatMap((x: Record<string, unknown>) => (x && typeof x.name === 'string' ? [{ name: str(x.name, 40), detail: str(x.detail, 80), at: num(x.at) ?? 0 }] : []))
@@ -786,7 +1026,7 @@ export const normalize = (raw: unknown): Status | null => {
 
 /** For /builds-tasks: this session's background tasks, each with its start and the last notification seen for it (id and status only). */
 export const bgReport = (s: Status, lost: readonly string[], now: number): string => {
-  const rows = s.bg.map(b => `${b.ended_at === null ? (now - b.started_at > BG_CAP_MS ? 'no news' : 'running') : 'ended'} · ${b.kind} · ${b.label} · id ${b.id} · started ${fmtClock(b.started_at)} · last notice: ${b.seen ? `${b.id} ${b.seen}` : 'none'}`)
+  const rows = s.bg.map(b => `${b.ended_at === null ? (now - b.started_at > BG_CAP_MS ? 'no news' : 'running') : 'ended'} · ${b.kind} · ${b.label} · id ${b.id} · started ${fmtClock(b.started_at)}${b.ended_at === null ? '' : ` · ended ${fmtClock(b.ended_at)} (${b.end ?? '?'})`} · last notice: ${b.seen ? `${b.id} ${b.seen}` : 'none'}`)
   const head = `${bgRunning(s, now).length} counted as running, ${s.bg.length} listed.`
   const extra = lost.length > 0 ? [`Notifications that named no listed task (id, status): ${lost.join('; ')}`] : []
 

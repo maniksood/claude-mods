@@ -1,17 +1,19 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { Status } from '../types'
+import type { Status, Task } from '../types'
 import { avatarSvg } from './art'
 import {
   ALL_DONE,
   BG_DONE_MS,
   DELETE_MS,
   HEARTBEAT_MS,
+  HIST_PATTERN,
   SESSION_CLOSED,
   STOPPED_BY_YOU,
   TURN_ENDED,
   addStep,
+  applyHist,
   applyParsed,
   applyPlan,
   applyTool,
@@ -25,6 +27,12 @@ import {
   colorFor,
   endBg,
   expectFrom,
+  fractionOf,
+  listFraction,
+  parseHist,
+  scanProgress,
+  setBgProgress,
+  type Hist,
   homeShown,
   isPlanTool,
   noticeBg,
@@ -64,6 +72,82 @@ let hasPrompt = false
 /** The last notifications that named no listed task, as `id status`; for /builds-tasks. */
 let lost: string[] = []
 
+/** A background agent's own checklist, by its agent id; for its %. */
+const agentTasks = new Map<string, Task[]>()
+let sessionId = ''
+let cwdNow = ''
+let homeDir = ''
+let tasksDir: string | null = null
+let isReconciling = false
+let beats = 0
+
+/** Where the transcript is: the folder is the working directory with every character outside letters, digits and `-` turned into `-`. */
+const transcriptPath = (): string => `${homeDir}/.claude/projects/${cwdNow.replace(/[^A-Za-z0-9-]/g, '-')}/${sessionId}.jsonl`
+
+/** The transcript's ids, status words, clock times and the session's name, found with `grep`; null when it cannot be read. Nothing else is taken from it. */
+const loadHist = async ($: Eng): Promise<Hist | null> => {
+  try {
+    const path = transcriptPath()
+    if (!(await $.fs.exists(path))) return null
+    const r = await $.process.run(['grep', '-noE', HIST_PATTERN, path], { timeoutMs: 30_000 })
+    if (r.exitCode > 1) return null
+
+    return parseHist(r.stdout)
+  } catch {
+    return null
+  }
+}
+
+/** The folder the app writes background output into: `<tmp>/claude-<uid>/<project>/<session>/tasks`. */
+const findTasksDir = async ($: Eng): Promise<string | null> => {
+  if (tasksDir) return tasksDir
+  const slug = cwdNow.replace(/[^A-Za-z0-9-]/g, '-')
+  for (const root of ['/private/tmp', '/tmp']) {
+    try {
+      for (const f of await $.fs.list(root)) {
+        if (f.kind !== 'directory' || !f.name.startsWith('claude-')) continue
+        const dir = `${root}/${f.name}/${slug}/${sessionId}/tasks`
+        if (await $.fs.exists(dir)) return (tasksDir = dir)
+      }
+    } catch {
+      // not there: no % for shells
+    }
+  }
+  return null
+}
+
+/** Reads the last lines of each running task's output file only to find `▶ n/N`, `NN%` and "N min left"; nothing of the text is kept. */
+const scanOutputs = async ($: Eng): Promise<void> => {
+  if (!status) return
+  const dir = await findTasksDir($)
+  if (!dir) return
+  const now = await $.clock.now()
+  for (const b of bgRunning(status, now)) {
+    if (b.kind === 'monitor') continue
+    try {
+      const r = await $.process.run(['tail', '-c', '16384', `${dir}/${b.id}.output`], { timeoutMs: 5000 })
+      if (r.exitCode !== 0) continue
+      const p = scanProgress(r.stdout, now)
+      await change($, s => setBgProgress(s, b.id, p, now), false)
+    } catch {
+      // no output file yet, or it cannot be read: no % reported
+    }
+  }
+}
+
+/** What the transcript says (ends the live notices missed, each task's own start, the name) and what the tasks' outputs say. */
+const reconcile = async ($: Eng): Promise<void> => {
+  if (isReconciling || !status) return
+  isReconciling = true
+  try {
+    const hist = await loadHist($)
+    if (hist) await change($, s => applyHist(s, hist), false)
+    await scanOutputs($)
+  } finally {
+    isReconciling = false
+  }
+}
+
 /** This session's own file is only for `/builds`; the pane and the band read the in-memory copy. */
 const writeNow = async ($: Eng): Promise<void> => {
   if (!status) return
@@ -82,7 +166,9 @@ const writeNow = async ($: Eng): Promise<void> => {
 const change = async ($: Eng, fn: (s: Status) => Status, touch = true): Promise<void> => {
   if (!status) return
   const now = await $.clock.now()
-  status = watchOf(settle(fn(touch ? { ...status, updated_at: now, alive_at: now } : status), now), now)
+  const before = fractionOf(status)
+  const next = settle(fn(touch ? { ...status, updated_at: now, alive_at: now } : status), now)
+  status = watchOf(fractionOf(next) === before ? next : { ...next, tasks_at: now }, now)
   const wait = lastWrite + WRITE_EVERY_MS - now
   if (wait <= 0) {
     await writeNow($)
@@ -142,7 +228,13 @@ export const register: Register = (on, options) => {
         // not a repository: branch stays "—"
       }
     }
+    sessionId = sid
+    cwdNow = cwd
+    homeDir = home ?? ''
+    tasksDir = null
+    agentTasks.clear()
     status = blankStatus(sid, scrub(homeShown(cwd, home), 120), branch, now)
+    const hist = await loadHist($)
     hasPrompt = false
     try {
       // the session's own history: its first prompt (id, EXPECT), its to-do list, its markers
@@ -151,7 +243,7 @@ export const register: Register = (on, options) => {
         hasPrompt = true
         // the history carries no clock; the session's launch is the nearest stamp to its first prompt
         const launch = (await $.session.usage()).startedAt
-        status = recover({ ...status, started_at: Number.isFinite(launch) ? launch : now }, rows, now)
+        status = recover({ ...status, started_at: Number.isFinite(launch) ? launch : now }, rows, now, hist)
       }
     } catch {
       // no history to read: the title stays the folder
@@ -164,9 +256,10 @@ export const register: Register = (on, options) => {
         const known = status.bg.map(b => {
           const was = old.bg.find(x => x.id === b.id || (b.tool_use_id !== '' && x.tool_use_id === b.tool_use_id))
 
-          return was ? { ...b, started_at: was.started_at } : b
+          return was && hist?.starts[b.id] === undefined ? { ...b, started_at: was.started_at } : b
         })
         const recent = old.bg.filter(x => x.ended_at !== null && now - x.ended_at <= BG_DONE_MS && !known.some(b => b.id === x.id))
+        status = { ...status, report: old.report, title: status.title || old.title }
         status = { ...status, bg: [...known, ...recent] }
         if (old.start_known) status = { ...status, started_at: old.started_at, start_known: true }
         else if (old.started_at < status.started_at) status = { ...status, started_at: old.started_at }
@@ -177,7 +270,8 @@ export const register: Register = (on, options) => {
     } catch {
       // no earlier file
     }
-    status = watchOf({ ...status, watch: null }, now)
+    if (hist) status = applyHist(status, hist)
+    status = watchOf({ ...status, watch: null, tasks_at: now }, now)
     lost = []
     await writeNow($)
     await $.command.register({ name: 'builds', description: 'List every Claude Code session and its progress' })
@@ -189,6 +283,9 @@ export const register: Register = (on, options) => {
     // a long tool call or helper writes nothing on its own: the heartbeat says the run is alive
     $.clock.every(HEARTBEAT_MS, () => {
       if (status) void $.clock.now().then(t => status && isBusy(status, t) && change($, s => s, true))
+      // the transcript is the safety net for a notice the live hook missed; quiet sessions look every fifth beat
+      beats += 1
+      if (status) void $.clock.now().then(t => status && (bgRunning(status, t).length > 0 || beats % 5 === 0) && reconcile($))
     })
 
     return next(e)
@@ -247,11 +344,23 @@ export const register: Register = (on, options) => {
 
   // The model's text comes from `session.append`: rows from the `response` door, main loop only.
   on('session.append', { door: 'response' }, async ($, e, next) => {
+    if (e.agentId && e.message.type === 'assistant') {
+      // a background agent's own markers give its %
+      const text = (Array.isArray(e.message.content) ? e.message.content : [])
+        .flatMap(b => (b && typeof b === 'object' && 'type' in b && b.type === 'text' && 'text' in b ? [String(b.text)] : []))
+        .join('\n')
+      const id = e.agentId
+      if (/▶|%|left|ETA/.test(text)) {
+        const now = await $.clock.now()
+        const p = scanProgress(text, now)
+        await change($, s => setBgProgress(s, id, p, now), false)
+      }
+    }
     if (!e.agentId && e.message.type === 'assistant') {
       const text = (Array.isArray(e.message.content) ? e.message.content : [])
         .flatMap(b => (b && typeof b === 'object' && 'type' in b && b.type === 'text' && 'text' in b ? [String(b.text)] : []))
         .join('\n')
-      if (text.includes('▶')) {
+      if (/▶|%|left|ETA/.test(text)) {
         const now = await $.clock.now()
         const parsed = parseText(text, now)
         await change($, s => applyParsed(s, parsed, now))
@@ -289,9 +398,21 @@ export const register: Register = (on, options) => {
 
   on('tool.call', async ($, e, next) => {
     if (e.agentId) {
-      await change($, s => s)
+      const id = e.agentId
+      const ran = await next(e)
+      const isList = (TASK_TOOLS.includes(e.tool) || isPlanTool(e.tool)) && !('deny' in ran && ran.deny)
+      const now = await $.clock.now()
+      if (isList) {
+        const was = agentTasks.get(id) ?? []
+        const tasks = isPlanTool(e.tool) ? applyPlan(was, e) : applyTool(was, e.tool, e, ran.result)
+        agentTasks.set(id, tasks)
+        const f = listFraction(tasks)
+        await change($, s => setBgProgress(s, id, { pct: f === null ? null : Math.round(f * 100), eta_at: null }, now))
+      } else {
+        await change($, s => s)
+      }
 
-      return next(e)
+      return ran
     }
     const startedAt = await $.clock.now()
     const call = toolNow(e)
@@ -395,12 +516,21 @@ export const register: Register = (on, options) => {
           {Svg ? <Svg source={avatarSvg(c.state, colorFor(me.prompt_id === '—' ? me.folder : me.prompt_id))} alt={c.state} width={32} height={30} isInteractive /> : <Text>{c.emoji}</Text>}
           <Text bold>{c.title}</Text>
         </Box>
-        {c.pct !== '' && <Text bold>{c.pct}</Text>}
-        {c.bar !== '' && <Text>{c.bar}</Text>}
-        {(c.end ?? c.left) !== '' && <Text>{c.end ?? c.left}</Text>}
-        <Text dimColor>{c.running}</Text>
-        {c.work !== '' && <Text bold>{c.work}</Text>}
-        {c.doing !== '' && <Text>{c.doing}</Text>}
+        <Box flexDirection="column" marginTop={1}>
+          <Text bold>Overall</Text>
+          {c.overall.pct !== null && <Text bold>{`${c.overall.pct}%`}</Text>}
+          {c.overall.pct !== null && <Text>{c.overall.bar}</Text>}
+          {c.overall.left !== '' && <Text>{c.overall.left}</Text>}
+          <Text dimColor>{c.overall.running}</Text>
+        </Box>
+        <Box flexDirection="column" marginTop={1}>
+          <Text bold>Main run</Text>
+          {c.end !== null && <Text>{c.end}</Text>}
+          {c.pct !== '' && <Text>{`${c.pct}  ${c.bar}`}</Text>}
+          {c.end === null && c.mainLeft !== '' && <Text>{c.mainLeft}</Text>}
+          {c.work !== '' && <Text bold>{c.work}</Text>}
+          {c.doing !== '' && <Text>{c.doing}</Text>}
+        </Box>
         {c.plain && c.steps.length > 0 && (
           <Box flexDirection="column" marginTop={1}>
             <Text bold>Last steps</Text>

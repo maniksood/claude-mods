@@ -29,8 +29,8 @@ const rig = (on: On, sid = 's1'): Rig => {
 
     return { value: undefined }
   })
-  on('fs.list', () => ({
-    value: [...files.entries()]
+  on('fs.list', (_, e) => ({
+    value: e.path === '/private/tmp' ? [{ name: 'claude-501', kind: 'directory' as const, size: 0, mtimeMs: 0, isLink: false }] : [...files.entries()]
       .filter(([p]) => p.startsWith(DIR))
       .map(([p, t]) => ({ name: p.slice(DIR.length + 1), kind: 'file' as const, size: t.length, mtimeMs: clock.now(), isLink: false })),
   }))
@@ -415,7 +415,7 @@ test('a background Bash: listed, counted, then moved to Done for 10 minutes, the
   expect(await bandText($)).toContain('🔄 1 in background')
   let ui = await mountPane($)
   let all = await texts(ui)
-  expect(all).toMatch(/🔄 Run the full test matrix · running for 2[34] min/)
+  expect(all).toMatch(/⌨️ Run the full test matrix · no % reported · running for 2[34] min/)
   await ui.unmount()
   await r.clock.advance(18 * 60_000)
   await $.session.append(notice('b1'))
@@ -455,7 +455,7 @@ test('the turn ends while one runs: Waiting, not Finished; when it ends: Finishe
   await $.turn.complete({ turnId: 'x', reason: 'answer', text: 'ok', answer: 'ok' } as never)
   await r.clock.advance(31_000)
   const waiting = await bandText($)
-  expect(waiting).toMatch(/⏳ Waiting on 1 background task · running for [56] min/)
+  expect(waiting).toMatch(/⏳ Waiting on 1 background task · 🔄 Run the full test matrix/)
   expect(waiting).not.toContain('Finished')
   let ui = await mountPane($)
   expect(await texts(ui)).not.toContain('Finished')
@@ -479,7 +479,7 @@ test('a background agent is listed, keeps the turn from Finished, and ends with 
   expect(await bandText($)).toContain('⏳ Waiting on 1 background task')
   const ui = await mountPane($)
   const all = await texts(ui)
-  expect(all).toContain('🔄 Check every page')
+  expect(all).toContain('🤖 Check every page')
   expect(all).not.toContain('👥')
   await ui.unmount()
   await $.turn.complete({ turnId: 'y', reason: 'answer', agentId: 'agent-1', text: 'ok' } as never)
@@ -502,7 +502,7 @@ test('a reload with one open background call: running, count 1, not Finished', a
   expect(band).not.toContain('Finished')
   const ui = await mountPane($)
   const all = await texts(ui)
-  expect(all).toContain('🔄 Run the full test matrix')
+  expect(all).toContain('Run the full test matrix · no % reported')
   expect(all).not.toContain('sk-live')
   await ui.unmount()
 })
@@ -583,7 +583,7 @@ test('the app\'s update_plan list gives the % live, and from history after a rel
   await r.clock.advance(31_000)
   const later = await bandText($)
   expect(later).toContain('50%')
-  expect(later).toMatch(/about \d+ min left \(from the last 1[23] min\)/)
+  expect(later).toMatch(/⏱ about \d+ min left/)
 })
 
 test('a notification row without the engine stamp still ends its task; /builds-tasks says what it saw', async ($, on) => {
@@ -605,4 +605,118 @@ test('a notification row without the engine stamp still ends its task; /builds-t
   expect(report).toContain('zz completed')
   expect(report).not.toContain('failed')
   expect(report).not.toContain('sk-live')
+})
+
+/** The real shape of a finished background task: an attachment row `queued_command`, stamped `task-notification`, the envelope inside a system reminder. Ids and words only. */
+const attachmentNotice = (id: string, status = 'completed') => ({
+  message: { type: 'attachment', name: 'queued_command', role: 'user', isMeta: true, content: [{ type: 'text', text: `<system-reminder>\n<task-notification><task-id>${id}</task-id><tool-use-id>toolu_x</tool-use-id><output-file>/x/${id}.output</output-file><status>${status}</status><summary>S</summary></task-notification>\n</system-reminder>` }] },
+  door: 'attachment',
+  origin: { kind: 'task-notification' },
+  uuid: `a-${id}`,
+}) as never
+
+test('the real finished row (an attachment) ends the shell and the agent, and /builds-tasks shows it', async ($, on) => {
+  const r = rig(on)
+  r.results.Bash = { backgroundTaskId: 'bsh1' }
+  await $.session.start(START)
+  await $.prompt.submit({ text: '# MOD-X' } as never)
+  await $.tool.call({ tool: 'Bash', tool_use_id: 'tu1', command: 'x', description: 'Sample shell', run_in_background: true } as never)
+  await $.agent.spawn({ tool_use_id: 'tu2', prompt: 'p', description: 'Sample agent', subagentType: 'general-purpose', background: true, provider: { plugin: 'engine', tier: 'core' } } as never)
+  await r.clock.advance(5000)
+  expect(mine(r).bg.filter((b: { ended_at: number | null }) => b.ended_at === null).length).toBe(2)
+  await $.session.append(attachmentNotice('bsh1'))
+  await $.session.append(attachmentNotice('agent-1'))
+  await r.clock.advance(5000)
+  expect(mine(r).bg.map((b: { id: string; end: string }) => [b.id, b.end])).toEqual([['bsh1', 'completed'], ['agent-1', 'completed']])
+  const text = await $.command.run({ command: 'builds-tasks' } as never)
+  expect(JSON.stringify(text)).toMatch(/0 counted as running, 2 listed/)
+  expect(JSON.stringify(text)).toMatch(/ended \d\d:\d\d \(completed\)/)
+})
+
+const GREP = (ts: string, body: string): string => `${body}`.replace('TS', ts)
+
+test('a reload: the transcript gives each task its own start, the end the live hook never saw, and the session\'s name', async ($, on) => {
+  const r = rig(on)
+  const path = `${HOME}/.claude/projects/-Users-tester-Work-claude-mods/s1.jsonl`
+  const T = r.clock.now()
+  const iso = (minAgo: number): string => new Date(T - minAgo * 60_000).toISOString()
+  const grep = [
+    `10:"timestamp":"${iso(200)}"`, '10:"backgroundTaskId":"old1"',
+    `11:"timestamp":"${iso(80)}"`, '11:"backgroundTaskId":"run1"',
+    `20:"timestamp":"${iso(120)}"`, '20:<task-id>old1</task-id>', '20:<status>completed</status>',
+    '30:"customTitle":"GQ3B form losing areas"',
+  ].join('\n')
+  const calls: string[][] = []
+  on('fs.exists', (_, e) => ({ value: e.path === path }))
+  on('process.run', (_, e) => {
+    calls.push([...e.argv])
+
+    return { value: { exitCode: 0, stdout: e.argv[0] === 'grep' ? grep : '', stderr: '' } as never }
+  })
+  r.history = [
+    { role: 'user', text: '# MOD-X' },
+    { role: 'assistant', text: '', toolUses: [{ tool: 'Bash', tool_use_id: 'a', input: { description: 'Old job', run_in_background: true }, result: { backgroundTaskId: 'old1' } }] },
+    { role: 'assistant', text: '', toolUses: [{ tool: 'Bash', tool_use_id: 'b', input: { description: 'Running job', run_in_background: true }, result: { backgroundTaskId: 'run1' } }] },
+  ]
+  await $.session.start(START)
+  await r.clock.advance(5000)
+  expect(calls.some(c => c[0] === 'grep' && c[3] === path)).toBe(true)
+  const bg = mine(r).bg as Array<{ id: string; started_at: number; ended_at: number | null }>
+  // the old one ended two hours ago and is gone; the other keeps its own start, not the reload
+  expect(bg.map(b => b.id)).toEqual(['run1'])
+  expect(bg[0]?.started_at).toBe(Date.parse(iso(80)))
+  expect(mine(r).title).toBe('GQ3B form losing areas')
+  const ui = await mountPane($)
+  expect(await texts(ui)).toContain('GQ3B form losing areas')
+  await ui.unmount()
+})
+
+test('the safety net: a task whose notice was missed is ended by the transcript within a minute', async ($, on) => {
+  const r = rig(on)
+  const path = `${HOME}/.claude/projects/-Users-tester-Work-claude-mods/s1.jsonl`
+  let grep = ''
+  on('fs.exists', (_, e) => ({ value: e.path === path }))
+  on('process.run', (_, e) => ({ value: { exitCode: grep ? 0 : 1, stdout: e.argv[0] === 'grep' ? grep : '', stderr: '' } as never }))
+  r.results.Bash = { backgroundTaskId: 'bsh1' }
+  await $.session.start(START)
+  await $.prompt.submit({ text: '# MOD-X' } as never)
+  await $.tool.call({ tool: 'Bash', tool_use_id: 'tu1', command: 'x', description: 'Sample', run_in_background: true } as never)
+  grep = ['5:"timestamp":"2026-10-28T07:41:50.500Z"', '5:<task-id>bsh1</task-id>', '5:<status>completed</status>'].join('\n')
+  await r.clock.advance(61_000)
+  await r.clock.advance(3000)
+  expect(mine(r).bg[0]).toMatchObject({ id: 'bsh1', end: 'completed' })
+})
+
+test('a running shell\'s output is scanned for a % and an end time, and none of it is shown or stored', async ($, on) => {
+  const r = rig(on)
+  const dir = '/private/tmp/claude-501/-Users-tester-Work-claude-mods/s1/tasks'
+  on('fs.exists', (_, e) => ({ value: e.path === dir }))
+  on('process.run', (_, e) => ({ value: { exitCode: e.argv[0] === 'tail' ? 0 : 1, stdout: e.argv[0] === 'tail' ? 'building with token sk-live-AbCdEf1234567890XyZ\n▶ step 1/4\n12 min left\n' : '', stderr: '' } as never }))
+  r.results.Bash = { backgroundTaskId: 'bsh1' }
+  await $.session.start(START)
+  await $.prompt.submit({ text: '# MOD-X' } as never)
+  await $.tool.call({ tool: 'Bash', tool_use_id: 'tu1', command: 'x', description: 'Sample', run_in_background: true } as never)
+  await r.clock.advance(61_000)
+  await r.clock.advance(3000)
+  expect(mine(r).bg[0]).toMatchObject({ id: 'bsh1', pct: 25 })
+  expect([...r.files.values()].join('\n')).not.toContain('sk-live')
+  const ui = await mountPane($)
+  const all = await texts(ui)
+  expect(all).toMatch(/Sample · 25% ▰▰▱▱▱▱▱▱ · running for 1 min · about 1[12] min left \(from its own line\)/)
+  expect(all).not.toContain('sk-live')
+  expect(await bandText($)).toContain('1 in background: Sample 25%, ~1')
+  await ui.unmount()
+})
+
+test('a background agent\'s own checklist gives its %', async ($, on) => {
+  const r = rig(on)
+  await $.session.start(START)
+  await $.prompt.submit({ text: '# MOD-X' } as never)
+  await $.agent.spawn({ tool_use_id: 'tu2', prompt: 'p', description: 'Sample agent', subagentType: 'general-purpose', background: true, provider: { plugin: 'engine', tier: 'core' } } as never)
+  await $.tool.call({ tool: 'TodoWrite', agentId: 'agent-1', todos: [{ content: 'A', status: 'completed' }, { content: 'B', status: 'in_progress' }, { content: 'C', status: 'pending' }, { content: 'D', status: 'pending' }] } as never)
+  await r.clock.advance(5000)
+  expect(mine(r).bg[0]).toMatchObject({ id: 'agent-1', pct: 25 })
+  await $.session.append({ door: 'response', agentId: 'agent-1', message: { type: 'assistant', content: [{ type: 'text', text: '▶ page 3/4' }] } } as never)
+  await r.clock.advance(5000)
+  expect(mine(r).bg[0]).toMatchObject({ pct: 75 })
 })
